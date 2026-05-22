@@ -67,7 +67,10 @@ export function InstrumentGeneratorPanel({
   activeSceneId,
   isAuthenticated,
   isConnected,
+  onHeaderContent,
+  onOpenContract,
   onExpandSelf,
+  sceneContext,
 }: PluginUIProps): React.ReactElement {
   const [tracks, setTracks] = useState<InstrumentTrackState[]>([]);
   const [library, setLibrary] = useState<InstrumentLibrary | null>(null);
@@ -117,7 +120,11 @@ export function InstrumentGeneratorPanel({
     [library],
   );
 
+  const needsContract = !sceneContext?.hasContract;
+
   // --- Add Track ---
+  // Declared above the header useEffect because the effect depends on this
+  // callback as a stable handler for the header's "+ Add" button.
   const handleAddTrack = useCallback(async (): Promise<void> => {
     if (isAddingTrackRef.current) return;
     if (!isConnected) {
@@ -167,6 +174,51 @@ export function InstrumentGeneratorPanel({
       setIsAddingTrack(false);
     }
   }, [host, tracks.length, isConnected, isAuthenticated, availableCategories, onExpandSelf]);
+
+  // --- Header content: "+ Add" button rendered up in the accordion strip.
+  // Mirrors drum-generator's pattern. When no contract exists the button
+  // bounces the user to the Contract section instead of trying to add a
+  // track (which would generate nothing useful without contract context).
+  useEffect(() => {
+    if (!onHeaderContent) return;
+    const addDisabled =
+      needsContract
+      || !isConnected
+      || !activeSceneId
+      || tracks.length >= MAX_TRACKS
+      || isAddingTrack
+      || availableCategories.length === 0;
+
+    onHeaderContent(
+      <div className="flex gap-1">
+        <button
+          data-testid="add-instrument-track-button"
+          onClick={(e: React.MouseEvent) => {
+            e.stopPropagation();
+            if (needsContract) { onOpenContract?.(); return; }
+            handleAddTrack();
+          }}
+          className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+            addDisabled
+              ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+              : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
+          }`}
+          title={
+            !activeSceneId ? 'Select a scene first'
+              : needsContract ? 'Generate a contract first'
+              : availableCategories.length === 0 ? 'Empty instrument library'
+              : tracks.length >= MAX_TRACKS ? `Track limit (${MAX_TRACKS}) reached`
+              : 'Create a new instrument track'
+          }
+        >
+          + Add
+        </button>
+      </div>
+    );
+    return () => { onHeaderContent(null); };
+  }, [onHeaderContent, sceneContext, isConnected, isAddingTrack,
+      needsContract, activeSceneId, tracks.length, availableCategories.length,
+      handleAddTrack, onOpenContract]);
 
   // --- Per-track state updates ---
   const updateTrack = useCallback((trackId: string, patch: Partial<InstrumentTrackState>) => {
@@ -303,6 +355,23 @@ export function InstrumentGeneratorPanel({
   }, [host, tracks, isAuthenticated, library, availableCategories, updateTrack]);
 
   // --- Render ---
+
+  // Scene needs a contract before track generation makes sense — the LLM
+  // depends on chord/contract context to voice notes intelligently. Mirror
+  // synth-generator + drum-generator's placeholder.
+  if (!sceneContext?.hasContract) {
+    return (
+      <div data-testid="no-contract-placeholder-instrument" className="flex items-center justify-center py-8">
+        <button
+          onClick={() => onOpenContract?.()}
+          className="text-sas-muted text-xs hover:text-sas-accent transition-colors underline underline-offset-2"
+        >
+          Generate a Contract
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div data-testid="instrument-section" className="p-2 space-y-2">
       {libraryError && (
@@ -345,22 +414,6 @@ export function InstrumentGeneratorPanel({
           instrumentName={track.loadedInstrumentName}
         />
       ))}
-
-      <button
-        data-testid="add-instrument-track"
-        onClick={handleAddTrack}
-        disabled={isAddingTrack || tracks.length >= MAX_TRACKS || availableCategories.length === 0}
-        className="w-full px-2 py-1.5 text-[10px] uppercase tracking-wide rounded-sm border text-sas-muted hover:text-sas-accent border-sas-border hover:border-sas-accent transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-        title={
-          availableCategories.length === 0
-            ? 'Empty library — generate samples first'
-            : tracks.length >= MAX_TRACKS
-              ? `Track limit (${MAX_TRACKS}) reached`
-              : 'Create a new instrument track'
-        }
-      >
-        + Add Instrument Track
-      </button>
 
       {availableCategories.length > 0 && (
         <div className="text-[10px] opacity-50 px-1">
