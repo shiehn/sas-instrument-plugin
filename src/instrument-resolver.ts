@@ -69,22 +69,23 @@ export interface InstrumentLibrary {
 }
 
 /**
- * Pick a random ResolvedInstrument from the given category. If `excludeId`
- * is provided AND the category has more than one instrument, the excluded
- * one is filtered out — lets the panel's shuffle button hand back a
- * different preset on each click.
+ * Pick a random ResolvedInstrument from the given category, excluding
+ * any whose `instrumentId` is in `excludeIds`. Returns null when the
+ * filtered pool is empty (either category empty OR caller has used
+ * every entry — the panel uses the null signal to reset its shuffle
+ * history and call again with an empty exclude set).
  *
- * Returns null if the category is unknown or empty.
+ * Returns null if the category is unknown.
  */
 export function pickInstrument(
   library: InstrumentLibrary,
   categoryId: string,
-  excludeId?: string,
+  excludeIds?: ReadonlySet<string>,
 ): ResolvedInstrument | null {
   const pool = library.byCategory.get(categoryId);
   if (!pool || pool.length === 0) return null;
-  const filtered = excludeId && pool.length > 1
-    ? pool.filter(p => p.instrumentId !== excludeId)
+  const filtered = excludeIds && excludeIds.size > 0
+    ? pool.filter(p => !excludeIds.has(p.instrumentId))
     : pool;
   if (filtered.length === 0) return null;
   const idx = Math.floor(Math.random() * filtered.length);

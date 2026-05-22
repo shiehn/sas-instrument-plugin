@@ -50,6 +50,15 @@ interface InstrumentTrackState {
   /** Currently-loaded instrument id (so shuffle could exclude it later) */
   loadedInstrumentId: string | null;
   loadedInstrumentName: string | null;
+  /**
+   * Per-track shuffle history. Set of instrumentIds the shuffle button
+   * has handed back since the track was created OR since the history
+   * was last reset (which happens automatically when the category's
+   * pool is exhausted, so the cycle wraps and starts over). Generate
+   * also wipes the history because picking a fresh random instrument
+   * is a new cycle.
+   */
+  shuffleHistory: Set<string>;
   isGenerating: boolean;
   error: string | null;
   hasMidi: boolean;
@@ -114,6 +123,7 @@ export function InstrumentGeneratorPanel({
           pan: 0,
           fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
           fxDrawerOpen: false,
+          shuffleHistory: new Set<string>(),
         })));
       } catch (err) {
         if (!cancelled) {
@@ -176,6 +186,7 @@ export function InstrumentGeneratorPanel({
         pan: 0,
         fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
         fxDrawerOpen: false,
+        shuffleHistory: new Set<string>(),
       }]);
       onExpandSelf?.();
     } catch (err) {
@@ -352,15 +363,29 @@ export function InstrumentGeneratorPanel({
       host.showToast('warning', 'Shuffle skipped', 'Generate first to set the category');
       return;
     }
+
+    // Cycle pattern: each shuffle picks from { pool - history }. When the
+    // filtered pool is empty we've cycled through every instrument in the
+    // category — reset history and try again with a fresh deck. Use the
+    // resulting Set to update track state so the next shuffle excludes the
+    // current pick too.
+    const history = track.shuffleHistory;
+    let picked = pickInstrument(library, category, history);
+    let nextHistory: Set<string>;
+    if (!picked) {
+      // Exhausted — wrap the deck and re-pick from full pool
+      nextHistory = new Set<string>();
+      picked = pickInstrument(library, category, nextHistory);
+    } else {
+      nextHistory = new Set(history);
+    }
+    if (!picked) {
+      host.showToast('warning', 'Shuffle skipped', `No instruments available in "${category}"`);
+      return;
+    }
+    nextHistory.add(picked.instrumentId);
+
     try {
-      // excludeId is the currently-loaded instrument's id — pickInstrument will
-      // filter it out as long as the category has more than one entry. With a
-      // single-entry category the same instrument is returned (no-op shuffle).
-      const picked = pickInstrument(library, category, track.loadedInstrumentId ?? undefined);
-      if (!picked) {
-        host.showToast('warning', 'Shuffle skipped', `No other instruments in "${category}"`);
-        return;
-      }
       await host.setTrackInstrumentSampler(trackId, {
         name: picked.displayName,
         zones: picked.zones,
@@ -368,9 +393,10 @@ export function InstrumentGeneratorPanel({
       updateTrack(trackId, {
         loadedInstrumentId: picked.instrumentId,
         loadedInstrumentName: picked.displayName,
+        shuffleHistory: nextHistory,
       });
       console.log(
-        `[InstrumentGeneratorPanel] shuffle: track ${trackId} → "${picked.displayName}" (${picked.instrumentId}), zone[0]=${picked.zones[0]?.samplePath}`
+        `[InstrumentGeneratorPanel] shuffle: track ${trackId} → "${picked.displayName}" (${picked.instrumentId}); history ${nextHistory.size}/${library.byCategory.get(category)?.length ?? '?'}; zone[0]=${picked.zones[0]?.samplePath}`
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Shuffle failed';
@@ -470,6 +496,10 @@ export function InstrumentGeneratorPanel({
         }
       }
 
+      // Generate starts a new shuffle cycle — seed history with the newly
+      // picked instrument so the next shuffle won't return the same one.
+      const freshHistory = new Set<string>();
+      if (loadedInstrumentId) freshHistory.add(loadedInstrumentId);
       updateTrack(trackId, {
         isGenerating: false,
         error: null,
@@ -478,6 +508,7 @@ export function InstrumentGeneratorPanel({
         loadedInstrumentName,
         hasMidi: true,
         generationProgress: 0,
+        shuffleHistory: freshHistory,
       });
       host.showToast('success', `Generated · ${chosenCategory} · ${loadedInstrumentName ?? '—'}`);
     } catch (err) {
