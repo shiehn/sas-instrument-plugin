@@ -2,13 +2,13 @@
   "id": "@signalsandsorcery/instrument-generator",
   "displayName": "Instruments",
   "version": "0.1.0",
-  "description": "Pitched, polyphonic sample-based instruments (walking skeleton)",
+  "description": "AI-powered pitched, polyphonic sample-based instruments",
   "generatorType": "midi",
   "main": "index.js",
   "author": "Signals & Sorcery",
   "minHostVersion": "1.0.0",
   "builtIn": true,
   "capabilities": {
-    "requiresLLM": false
+    "requiresLLM": true
   }
 }
