@@ -19,12 +19,24 @@
  *      are intentionally cheaper and lower-quality than multi-zone instruments
  *      (no pitch correction, no formant-preserved pre-rendering at extremes).
  *
- * The resolver dispatches per-entry: `Dirent.isDirectory()` → shape 1,
- * `Dirent.isFile()` with .wav/.flac extension → shape 2. Both contribute
- * to the same per-category `ResolvedInstrument[]` list returned to the UI.
+ * Implementation: 100% host-mediated FS access (no direct `fs/promises` or
+ * `path` imports). The renderer process has Electron context isolation —
+ * a direct `import('fs/promises')` returns undefined and silently fails.
+ * All FS work goes through `host.listAudioFiles` (recursive sample
+ * discovery) and `host.readTextFile` (manifest.json + .txt prompt
+ * siblings). Both are IPC proxies to the main process where Node fs is
+ * available. This is the same pattern the drum plugin's kit-resolver uses.
  *
- * v0.6 scope: read both shapes, list them, expose zone arrays. No caching
- * nuance, no hot reload — call `loadLibrary()` again to re-scan.
+ * Discovery strategy:
+ *   - `host.listAudioFiles(<root>/instruments, { recursive: true })` returns
+ *     all sample files under any category, at any depth.
+ *   - Each path is classified by the number of segments below the instruments
+ *     root: 2 segments = flat, 3+ = inside a manifest folder.
+ *   - For each unique manifest-folder candidate, `host.readTextFile` is called
+ *     once; null means "no manifest" (or unreadable) and we skip silently.
+ *
+ * v0.6 scope: no caching nuance, no hot reload. Call `loadLibrary()` again
+ * to re-scan.
  */
 
 import type { PluginHost, InstrumentZone } from '@signalsandsorcery/plugin-sdk';
@@ -33,17 +45,17 @@ import type { InstrumentManifest } from './manifest-types';
 export interface ResolvedInstrument {
   /** Category folder name, e.g. "plucks" */
   categoryId: string;
-  /** Display category from manifest, e.g. "Plucks" */
+  /** Display category from manifest (multi-zone) or title-cased folder name (flat). */
   categoryDisplay: string;
-  /** Stable id from manifest, e.g. "plucks-bright-warm-a3f2e8c1" */
+  /** Stable id from manifest, or filename-without-extension for flat instruments. */
   instrumentId: string;
-  /** Display name derived from the prompt's first ~40 chars */
+  /** Display name derived from the prompt's first ~40 chars. */
   displayName: string;
-  /** Original positive prompt — surfaced in tooltip / detail view */
+  /** Original positive prompt — surfaced in tooltip / detail view. */
   prompt: string;
-  /** Zones ready to hand to host.setTrackInstrumentSampler */
+  /** Zones ready to hand to host.setTrackInstrumentSampler. */
   zones: InstrumentZone[];
-  /** Manifest folder absolute path (for diagnostics) */
+  /** Folder absolute path holding this instrument — for diagnostics. */
   manifestDir: string;
 }
 
@@ -58,130 +70,94 @@ export interface InstrumentLibrary {
 
 /**
  * Load a library from `<root>/instruments`. Returns an empty library if the
- * root doesn't exist; logs a warning if scanning errors out.
- *
- * `host.listAudioFiles` doesn't read JSON, so the resolver shells out to the
- * preload-exposed fs APIs. The walking-skeleton uses dynamic `await import('fs/promises')`
- * inside the plugin renderer process, which works because builtins run in
- * the main-process renderer where node-integration is enabled.
+ * root doesn't exist or no audio files were found.
  */
 export async function loadLibrary(host: PluginHost, rootPath: string): Promise<InstrumentLibrary> {
-  const fs = await import('fs/promises');
-  const path = await import('path');
+  const instrumentsRoot = joinPath(rootPath, 'instruments');
 
-  const instrumentsRoot = path.join(rootPath, 'instruments');
-  const all: ResolvedInstrument[] = [];
+  // Single recursive scan finds every sample under every category, at every depth.
+  // listAudioFiles silently returns [] for a missing root — no try/catch needed.
+  const samplePaths = await host.listAudioFiles(instrumentsRoot, {
+    extensions: ['.wav', '.flac'],
+    recursive: true,
+  });
 
-  let categoryEntries: import('fs').Dirent[];
-  try {
-    categoryEntries = await fs.readdir(instrumentsRoot, { withFileTypes: true });
-  } catch (err) {
-    // Missing root is the expected pre-generation state — return empty.
-    console.warn(`[instrument-resolver] No instruments root at ${instrumentsRoot}; library is empty.`);
+  if (samplePaths.length === 0) {
+    console.warn(`[instrument-resolver] No samples found under ${instrumentsRoot}; library is empty.`);
     return { categories: [], byCategory: new Map(), all: [] };
   }
 
-  for (const catEntry of categoryEntries) {
-    if (!catEntry.isDirectory() || catEntry.name.startsWith('_')) continue;
-    const catDir = path.join(instrumentsRoot, catEntry.name);
+  // Group sample paths by classification. Each path is relative to instrumentsRoot:
+  //   "plucks/p.wav"                       → flat (2 segments)
+  //   "plucks/hand-test/sources/a.wav"     → inside subdir hand-test (4 segments)
+  //   "plucks/multi-zone-test/zones/x.wav" → inside subdir multi-zone-test (4 segments)
+  //
+  // For the flat case we synthesize an instrument inline.
+  // For the subdir case we collect (category, subdir) pairs to look up manifests.
+  const all: ResolvedInstrument[] = [];
+  const manifestFolders = new Set<string>(); // "<category>/<subdir>"
 
-    let instrumentEntries: import('fs').Dirent[];
-    try {
-      instrumentEntries = await fs.readdir(catDir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
+  for (const samplePath of samplePaths) {
+    const rel = relativeTo(samplePath, instrumentsRoot);
+    if (!rel) continue; // shouldn't happen but defensive
+    const segments = rel.split('/').filter(Boolean);
+    if (segments.length < 2) continue; // file directly under instruments/, ignore
+    if (segments.some(s => s.startsWith('_'))) continue; // _-prefix skip (e.g. _failures/)
 
-    for (const instEntry of instrumentEntries) {
-      if (instEntry.name.startsWith('_')) continue;
+    const categoryId = segments[0];
 
-      if (instEntry.isDirectory()) {
-        // Shape 1: manifest folder (Phase 1.0+ multi-zone instrument)
-        const instDir = path.join(catDir, instEntry.name);
-        const manifestPath = path.join(instDir, 'manifest.json');
-
-        let manifest: InstrumentManifest;
-        try {
-          const raw = await fs.readFile(manifestPath, 'utf8');
-          manifest = JSON.parse(raw) as InstrumentManifest;
-        } catch (err) {
-          console.warn(`[instrument-resolver] Skipping ${manifestPath}: ${(err as Error).message}`);
-          continue;
-        }
-
-        if (manifest.schema_version !== 1 || !Array.isArray(manifest.zones) || manifest.zones.length === 0) {
-          console.warn(`[instrument-resolver] Skipping ${manifestPath}: invalid schema or no zones`);
-          continue;
-        }
-
-        const zones: InstrumentZone[] = manifest.zones.map(z => ({
-          // path.resolve respects absolute paths (`/Users/...` wins over instDir)
-          // and joins relative paths (`zones/060.flac` → `<instDir>/zones/060.flac`).
-          // Real pipeline output is relative; the hand-crafted multi-zone test
-          // uses absolute paths to reuse existing drum WAVs.
-          samplePath: path.resolve(instDir, z.sample),
-          rootKey: z.root_midi,
-          minKey: z.min_midi,
-          maxKey: z.max_midi,
-          openEnded: manifest.open_ended,
-        }));
-
-        all.push({
-          categoryId: catEntry.name,
-          categoryDisplay: manifest.category_display || catEntry.name,
-          instrumentId: manifest.instrument_id,
-          displayName: deriveDisplayName(manifest.prompt, manifest.instrument_id),
-          prompt: manifest.prompt,
-          zones,
-          manifestDir: instDir,
-        });
-        continue;
-      }
-
-      if (instEntry.isFile()) {
-        // Shape 2: flat WAV/FLAC at category root (Phase 0.6 single-zone synthesized).
-        // Filename without extension is the instrument id; sibling .txt holds the
-        // prompt. We synthesize one zone covering the full keyboard rooted at C4
-        // (60); Tracktion handles pitch-shift on note != rootKey. No pitch
-        // correction, no formant preservation — quality degrades at extremes.
-        const lower = instEntry.name.toLowerCase();
-        if (!lower.endsWith('.wav') && !lower.endsWith('.flac')) continue;
-
-        const samplePath = path.join(catDir, instEntry.name);
-        const baseName = instEntry.name.replace(/\.(wav|flac)$/i, '');
-        const promptPath = path.join(catDir, `${baseName}.txt`);
-
-        let prompt = '';
-        try {
-          prompt = (await fs.readFile(promptPath, 'utf8')).trim();
-        } catch {
-          // No sibling .txt is fine — fall back to filename for display.
-        }
-
-        all.push({
-          categoryId: catEntry.name,
-          categoryDisplay: titleCase(catEntry.name),
-          instrumentId: baseName,
-          displayName: deriveDisplayName(prompt, baseName),
-          prompt,
-          zones: [{
-            samplePath,
-            rootKey: 60,
-            minKey: 0,
-            maxKey: 127,
-            openEnded: false,
-          }],
-          manifestDir: catDir,
-        });
-      }
+    if (segments.length === 2) {
+      // Flat shape: <category>/<filename>
+      const filename = segments[1];
+      all.push(await buildFlatInstrument(host, instrumentsRoot, categoryId, filename));
+    } else {
+      // Manifest-folder shape: <category>/<subdir>/...
+      manifestFolders.add(`${categoryId}/${segments[1]}`);
     }
   }
 
-  // Note: host.listAudioFiles is unused here — we intentionally use fs
-  // directly because we need JSON-parsing, not just file-walking. Keep the
-  // host parameter in the signature so future versions can switch to a
-  // host-mediated FS without changing call sites.
-  void host;
+  // One read per unique manifest folder.
+  for (const folderKey of manifestFolders) {
+    const [categoryId, subdir] = folderKey.split('/');
+    const manifestDir = joinPath(instrumentsRoot, categoryId, subdir);
+    const manifestPath = joinPath(manifestDir, 'manifest.json');
+    const raw = await host.readTextFile(manifestPath);
+    if (raw === null) {
+      console.warn(`[instrument-resolver] Skipping ${manifestPath}: no readable manifest.json`);
+      continue;
+    }
+
+    let manifest: InstrumentManifest;
+    try {
+      manifest = JSON.parse(raw) as InstrumentManifest;
+    } catch (err) {
+      console.warn(`[instrument-resolver] Skipping ${manifestPath}: ${(err as Error).message}`);
+      continue;
+    }
+
+    if (manifest.schema_version !== 1 || !Array.isArray(manifest.zones) || manifest.zones.length === 0) {
+      console.warn(`[instrument-resolver] Skipping ${manifestPath}: invalid schema or no zones`);
+      continue;
+    }
+
+    const zones: InstrumentZone[] = manifest.zones.map(z => ({
+      samplePath: resolveZonePath(manifestDir, z.sample),
+      rootKey: z.root_midi,
+      minKey: z.min_midi,
+      maxKey: z.max_midi,
+      openEnded: manifest.open_ended,
+    }));
+
+    all.push({
+      categoryId,
+      categoryDisplay: manifest.category_display || titleCase(categoryId),
+      instrumentId: manifest.instrument_id,
+      displayName: deriveDisplayName(manifest.prompt, manifest.instrument_id),
+      prompt: manifest.prompt,
+      zones,
+      manifestDir,
+    });
+  }
 
   const byCategory = new Map<string, ResolvedInstrument[]>();
   for (const inst of all) {
@@ -199,6 +175,69 @@ export async function loadLibrary(host: PluginHost, rootPath: string): Promise<I
   );
 
   return { categories, byCategory, all };
+}
+
+/** Build a single-zone instrument from a flat <category>/<filename> sample. */
+async function buildFlatInstrument(
+  host: PluginHost,
+  instrumentsRoot: string,
+  categoryId: string,
+  filename: string,
+): Promise<ResolvedInstrument> {
+  const samplePath = joinPath(instrumentsRoot, categoryId, filename);
+  const baseName = stripAudioExt(filename);
+  const promptPath = joinPath(instrumentsRoot, categoryId, `${baseName}.txt`);
+
+  const promptRaw = await host.readTextFile(promptPath);
+  const prompt = promptRaw ? promptRaw.trim() : '';
+
+  return {
+    categoryId,
+    categoryDisplay: titleCase(categoryId),
+    instrumentId: baseName,
+    displayName: deriveDisplayName(prompt, baseName),
+    prompt,
+    zones: [{
+      samplePath,
+      rootKey: 60,
+      minKey: 0,
+      maxKey: 127,
+      openEnded: false,
+    }],
+    manifestDir: joinPath(instrumentsRoot, categoryId),
+  };
+}
+
+// ---------- path helpers (string-only; avoids `import('path')` in renderer) ----------
+
+/** Join absolute base + segments with '/' — single platform (Electron on mac/linux/win-posix-paths). */
+function joinPath(...segments: string[]): string {
+  return segments
+    .map((s, i) => (i === 0 ? s.replace(/\/+$/, '') : s.replace(/^\/+|\/+$/g, '')))
+    .filter(s => s.length > 0)
+    .join('/');
+}
+
+/** Return `absPath` relative to `rootPath`, or null if absPath doesn't start with rootPath. */
+function relativeTo(absPath: string, rootPath: string): string | null {
+  const root = rootPath.replace(/\/+$/, '');
+  if (!absPath.startsWith(root + '/')) return null;
+  return absPath.slice(root.length + 1);
+}
+
+/**
+ * Resolve a zone's `sample` field against its manifest folder.
+ *   - Absolute path (`/foo/bar.wav`) → returned as-is (hand-test fixtures use this
+ *     to reuse existing drum WAVs in stand-in tests)
+ *   - Relative path (`zones/060.flac`) → joined onto manifestDir (real pipeline output)
+ */
+function resolveZonePath(manifestDir: string, sample: string): string {
+  if (sample.startsWith('/')) return sample;
+  return joinPath(manifestDir, sample);
+}
+
+function stripAudioExt(filename: string): string {
+  return filename.replace(/\.(wav|flac)$/i, '');
 }
 
 /**
