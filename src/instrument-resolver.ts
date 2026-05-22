@@ -69,6 +69,29 @@ export interface InstrumentLibrary {
 }
 
 /**
+ * Pick a random ResolvedInstrument from the given category. If `excludeId`
+ * is provided AND the category has more than one instrument, the excluded
+ * one is filtered out — lets the panel's shuffle button hand back a
+ * different preset on each click.
+ *
+ * Returns null if the category is unknown or empty.
+ */
+export function pickInstrument(
+  library: InstrumentLibrary,
+  categoryId: string,
+  excludeId?: string,
+): ResolvedInstrument | null {
+  const pool = library.byCategory.get(categoryId);
+  if (!pool || pool.length === 0) return null;
+  const filtered = excludeId && pool.length > 1
+    ? pool.filter(p => p.instrumentId !== excludeId)
+    : pool;
+  if (filtered.length === 0) return null;
+  const idx = Math.floor(Math.random() * filtered.length);
+  return filtered[idx];
+}
+
+/**
  * Load a library from `<root>/instruments`. Returns an empty library if the
  * root doesn't exist or no audio files were found.
  */
