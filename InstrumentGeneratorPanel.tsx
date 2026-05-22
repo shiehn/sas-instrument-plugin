@@ -265,6 +265,44 @@ export function InstrumentGeneratorPanel({
     try { await host.setTrackPan(trackId, pan); } catch { /* */ }
   }, [host, updateTrack]);
 
+  // --- Shuffle: swap the loaded instrument for a different one in the same category ---
+  // Mirrors DrumGeneratorPanel.tsx:660. Only meaningful after Generate has populated
+  // track.category; TrackRow gates the button on hasMidi so this is safe to wire
+  // unconditionally — the button hides until a generation has run.
+  const handleShuffle = useCallback(async (trackId: string): Promise<void> => {
+    const track = tracks.find(t => t.handle.id === trackId);
+    if (!track || !library) return;
+    const category = track.category;
+    if (!category) {
+      host.showToast('warning', 'Shuffle skipped', 'Generate first to set the category');
+      return;
+    }
+    try {
+      // excludeId is the currently-loaded instrument's id — pickInstrument will
+      // filter it out as long as the category has more than one entry. With a
+      // single-entry category the same instrument is returned (no-op shuffle).
+      const picked = pickInstrument(library, category, track.loadedInstrumentId ?? undefined);
+      if (!picked) {
+        host.showToast('warning', 'Shuffle skipped', `No other instruments in "${category}"`);
+        return;
+      }
+      await host.setTrackInstrumentSampler(trackId, {
+        name: picked.displayName,
+        zones: picked.zones,
+      });
+      updateTrack(trackId, {
+        loadedInstrumentId: picked.instrumentId,
+        loadedInstrumentName: picked.displayName,
+      });
+      console.log(
+        `[InstrumentGeneratorPanel] shuffle: track ${trackId} → "${picked.displayName}" (${picked.instrumentId}), zone[0]=${picked.zones[0]?.samplePath}`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Shuffle failed';
+      host.showToast('error', 'Shuffle failed', msg);
+    }
+  }, [host, tracks, library, updateTrack]);
+
   // --- Generate: prompt → LLM → MIDI + sampler load ---
   const handleGenerate = useCallback(async (trackId: string): Promise<void> => {
     const track = tracks.find(t => t.handle.id === trackId);
@@ -425,6 +463,7 @@ export function InstrumentGeneratorPanel({
           estimatedGenerationMs={ESTIMATED_GENERATION_MS}
           onPromptChange={(p: string) => handlePromptChange(track.handle.id, p)}
           onGenerate={() => handleGenerate(track.handle.id)}
+          onShuffle={() => handleShuffle(track.handle.id)}
           onDelete={() => handleDeleteTrack(track.handle.id)}
           onMuteToggle={() => handleMuteToggle(track.handle.id)}
           onSoloToggle={() => handleSoloToggle(track.handle.id)}
