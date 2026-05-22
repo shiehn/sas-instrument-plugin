@@ -320,6 +320,20 @@ export function InstrumentGeneratorPanel({
         ? requestedCategory
         : availableCategories[0];
 
+      // Persist the chosen category as the track role so downstream UI
+      // (FX defaults, contract-aware features, future plugins) can scope by
+      // category. Mirrors the drum plugin's setTrackRole call after MIDI
+      // is committed. Without this the tracks row stores role='' and the
+      // engine treats the track as a generic synth (which can route to the
+      // default Surge XT instead of the sampler we just loaded).
+      if (chosenCategory && chosenCategory !== track.category) {
+        try {
+          await host.setTrackRole(trackId, chosenCategory);
+        } catch (err) {
+          console.warn('[InstrumentGeneratorPanel] setTrackRole failed:', err);
+        }
+      }
+
       // Pick a random instrument from the matching category and load it.
       const picked = pickInstrument(library, chosenCategory);
       let loadedInstrumentId = track.loadedInstrumentId;
@@ -332,6 +346,12 @@ export function InstrumentGeneratorPanel({
           });
           loadedInstrumentId = picked.instrumentId;
           loadedInstrumentName = picked.displayName;
+          // Diagnostic — surfaces which sample file backed this generation so
+          // "I think it sounds wrong" complaints can be checked against the
+          // actual WAV on disk.
+          console.log(
+            `[InstrumentGeneratorPanel] track ${trackId} → category="${chosenCategory}", instrument="${picked.displayName}" (${picked.instrumentId}), zone[0]=${picked.zones[0]?.samplePath}`
+          );
         } catch (err) {
           console.warn('[InstrumentGeneratorPanel] setTrackInstrumentSampler failed:', err);
         }
