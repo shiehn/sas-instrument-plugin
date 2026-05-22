@@ -30,6 +30,10 @@ import type {
   PluginTrackHandle,
   PluginMidiNote,
   MidiClipData,
+  FxCategory,
+  TrackFxDetailState,
+  PluginTrackFxDetailState,
+  PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
 import { TrackRow, EMPTY_FX_DETAIL_STATE } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
@@ -55,6 +59,10 @@ interface InstrumentTrackState {
   solo: boolean;
   volume: number;
   pan: number;
+  // FX drawer state (mirrors drum panel). Optimistically updated by the
+  // handleFx* callbacks; reverted on host-call failure.
+  fxDetailState: TrackFxDetailState;
+  fxDrawerOpen: boolean;
 }
 
 interface LLMInstrumentResponse {
@@ -104,6 +112,8 @@ export function InstrumentGeneratorPanel({
           solo: false,
           volume: 0.75,
           pan: 0,
+          fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
+          fxDrawerOpen: false,
         })));
       } catch (err) {
         if (!cancelled) {
@@ -164,6 +174,8 @@ export function InstrumentGeneratorPanel({
         solo: false,
         volume: 0.75,
         pan: 0,
+        fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
+        fxDrawerOpen: false,
       }]);
       onExpandSelf?.();
     } catch (err) {
@@ -264,6 +276,69 @@ export function InstrumentGeneratorPanel({
     updateTrack(trackId, { pan });
     try { await host.setTrackPan(trackId, pan); } catch { /* */ }
   }, [host, updateTrack]);
+
+  // --- FX drawer + per-category controls ---
+  // Lifted verbatim from DrumGeneratorPanel.tsx (~lines 698-751); shape is
+  // generic — no drum-specific bits — so it ports cleanly. Pattern is
+  // optimistic local update, then host call, then revert on failure.
+  const handleFxToggle = useCallback((trackId: string, category: FxCategory, enabled: boolean): void => {
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId
+        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], enabled } } }
+        : t
+    ));
+    host.toggleTrackFx(trackId, category, enabled).catch(() => {
+      setTracks(prev => prev.map(t =>
+        t.handle.id === trackId
+          ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], enabled: !enabled } } }
+          : t
+      ));
+    });
+  }, [host]);
+
+  const handleFxPresetChange = useCallback((trackId: string, category: FxCategory, presetIndex: number): void => {
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId
+        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], presetIndex } } }
+        : t
+    ));
+    host.setTrackFxPreset(trackId, category, presetIndex).then(result => {
+      if (result.dryWet !== undefined) {
+        setTracks(prev => prev.map(t =>
+          t.handle.id === trackId
+            ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], dryWet: result.dryWet as number } } }
+            : t
+        ));
+      }
+    }).catch(() => {});
+  }, [host]);
+
+  const handleFxDryWetChange = useCallback((trackId: string, category: FxCategory, value: number): void => {
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId
+        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], dryWet: value } } }
+        : t
+    ));
+    host.setTrackFxDryWet(trackId, category, value).catch(() => {});
+  }, [host]);
+
+  const toggleFxDrawer = useCallback((trackId: string): void => {
+    // Toggle the drawer's open state and, when opening, lazily fetch the
+    // current FX state from the engine so the drawer renders accurate
+    // preset/dry-wet values rather than the EMPTY_FX_DETAIL_STATE
+    // placeholder the track was created with.
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId ? { ...t, fxDrawerOpen: !t.fxDrawerOpen } : t
+    ));
+    const track = tracks.find(t => t.handle.id === trackId);
+    if (track && !track.fxDrawerOpen) {
+      host.getTrackFxState(trackId).then(fxState => {
+        setTracks(prev => prev.map(t =>
+          t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
+        ));
+      }).catch(() => {});
+    }
+  }, [host, tracks]);
 
   // --- Shuffle: swap the loaded instrument for a different one in the same category ---
   // Mirrors DrumGeneratorPanel.tsx:660. Only meaningful after Generate has populated
@@ -453,8 +528,8 @@ export function InstrumentGeneratorPanel({
             volume: track.volume,
             pan: track.pan,
           }}
-          fxDetailState={EMPTY_FX_DETAIL_STATE}
-          fxDrawerOpen={false}
+          fxDetailState={track.fxDetailState}
+          fxDrawerOpen={track.fxDrawerOpen}
           isGenerating={track.isGenerating}
           isAuthenticated={isAuthenticated}
           error={track.error}
@@ -464,6 +539,10 @@ export function InstrumentGeneratorPanel({
           onPromptChange={(p: string) => handlePromptChange(track.handle.id, p)}
           onGenerate={() => handleGenerate(track.handle.id)}
           onShuffle={() => handleShuffle(track.handle.id)}
+          onFxToggle={(cat: FxCategory, en: boolean) => handleFxToggle(track.handle.id, cat, en)}
+          onFxPresetChange={(cat: FxCategory, idx: number) => handleFxPresetChange(track.handle.id, cat, idx)}
+          onFxDryWetChange={(cat: FxCategory, v: number) => handleFxDryWetChange(track.handle.id, cat, v)}
+          onToggleFxDrawer={() => toggleFxDrawer(track.handle.id)}
           onDelete={() => handleDeleteTrack(track.handle.id)}
           onMuteToggle={() => handleMuteToggle(track.handle.id)}
           onSoloToggle={() => handleSoloToggle(track.handle.id)}
@@ -536,6 +615,27 @@ function parseLLMInstrumentResponse(content: string): LLMInstrumentResponse | nu
   } catch {
     return null;
   }
+}
+
+/**
+ * Convert the SDK's PluginTrackFxDetailState (fetched via host.getTrackFxState)
+ * into the slimmer TrackFxDetailState shape the TrackRow component expects.
+ * Lifted verbatim from DrumGeneratorPanel.tsx:1015-1028 — generic helper, no
+ * drum-specific bits.
+ */
+function pluginFxToToggleFx(sdkState: PluginTrackFxDetailState): TrackFxDetailState {
+  const result = { ...EMPTY_FX_DETAIL_STATE };
+  for (const category of ['eq', 'compressor', 'chorus', 'phaser', 'delay', 'reverb'] as const) {
+    const sdkCat = sdkState[category] as PluginFxCategoryDetailState | undefined;
+    if (sdkCat) {
+      result[category] = {
+        enabled: sdkCat.enabled,
+        presetIndex: sdkCat.presetIndex,
+        dryWet: sdkCat.dryWet,
+      };
+    }
+  }
+  return result;
 }
 
 // Re-export for the panel container; keeps the InstrumentGeneratorPlugin's
