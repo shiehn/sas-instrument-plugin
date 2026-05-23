@@ -93,11 +93,21 @@ export function pickInstrument(
 }
 
 /**
- * Load a library from `<root>/instruments`. Returns an empty library if the
- * root doesn't exist or no audio files were found.
+ * Load a library from `categoriesRoot` — a directory whose immediate children
+ * are category folders (plucks/, basses/, pianos/, ...). Returns an empty
+ * library if the root doesn't exist or no audio files were found.
+ *
+ * Phase 1.1 (sample-pack distribution): the pack zip already structures its
+ * payload as `<category>/<id>/...` so the install root (`<userData>/samples/instruments/`)
+ * IS the categoriesRoot. Previously this function appended `/instruments` to
+ * accommodate the dev layout `~/Downloads/outputs/instruments/`; callers
+ * should now pass the categories-parent directly.
  */
-export async function loadLibrary(host: PluginHost, rootPath: string): Promise<InstrumentLibrary> {
-  const instrumentsRoot = joinPath(rootPath, 'instruments');
+export async function loadLibrary(host: PluginHost, categoriesRoot: string): Promise<InstrumentLibrary> {
+  // Alias kept so the function body below (existing variable names + log
+  // strings) doesn't churn. categoriesRoot is the new external name; locally
+  // we still call it instrumentsRoot.
+  const instrumentsRoot = categoriesRoot;
 
   // Single recursive scan finds every sample under every category, at every depth.
   // listAudioFiles silently returns [] for a missing root — no try/catch needed.
@@ -282,17 +292,6 @@ function titleCase(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-/**
- * The walking-skeleton scans this hardcoded path. The pipeline's enrich
- * step writes to `<repo>/outputs/instruments/<cat>/<id>/`. For local
- * iteration on a dev box, the easiest path is to symlink:
- *
- *   ln -s /Users/<you>/sas-platform/sas-sample-generator/outputs \
- *         /Users/<you>/Downloads/outputs
- *
- * which lines up with the drums plugin's existing `DEFAULT_SAMPLE_ROOT`.
- * A real release will move this under app-data or a user-configurable
- * preference; the manifest contract is already version-tagged so the
- * resolver can grow without breaking existing libraries.
- */
-export const DEFAULT_SAMPLE_ROOT = '/Users/stevehiehn/Downloads/outputs';
+// Phase 1.1: DEFAULT_SAMPLE_ROOT removed — the panel now resolves the install
+// root at runtime via `host.getSamplePackRoot('sas-instrument-pack')`. See
+// PackDownloadService + sample-packs.ts for the distribution model.

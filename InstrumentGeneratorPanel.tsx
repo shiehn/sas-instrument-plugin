@@ -28,6 +28,7 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import type {
   PluginUIProps,
   PluginTrackHandle,
+  PluginTrackRuntimeState,
   PluginMidiNote,
   MidiClipData,
   FxCategory,
@@ -37,7 +38,14 @@ import type {
 } from '@signalsandsorcery/plugin-sdk';
 import { TrackRow, EMPTY_FX_DETAIL_STATE } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
-import { loadLibrary, pickInstrument, DEFAULT_SAMPLE_ROOT, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
+import { loadLibrary, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
+
+// Standalone sibling-plugin fallback: the sas-assistant builtin resolves the
+// library root at runtime via host.getSamplePackRoot(...). The sibling
+// doesn't wire that flow yet (would require shared CTA components in the
+// SDK), so it hardcodes the legacy dev path. End users run the in-app
+// builtin; this sibling is a dev scaffold.
+const DEFAULT_SAMPLE_ROOT = '/Users/stevehiehn/Downloads/outputs/instruments';
 
 const MAX_TRACKS = 16;
 const ESTIMATED_GENERATION_MS = 15000;
@@ -95,7 +103,17 @@ export function InstrumentGeneratorPanel({
   const [isAddingTrack, setIsAddingTrack] = useState(false);
   const isAddingTrackRef = useRef(false);
 
-  // --- Initial library scan + reclaim any existing instrument tracks on this scene ---
+  // Engine track id → stable DB UUID. Used to key plugin_data writes by the
+  // DB id (stable across reloads) rather than the engine id (re-assigned
+  // when Tracktion reloads the .sas file). Mirrors SynthGeneratorPanel.
+  const engineToDbIdRef = useRef<Map<string, string>>(new Map());
+  // Per-track debounce handles for prompt saves.
+  const saveTimeoutRefs = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // Tracks which scene the current `tracks` array was loaded for; guards
+  // against scene-switch races when an in-flight load resolves late.
+  const tracksLoadedForSceneRef = useRef<string | null>(null);
+
+  // --- Library scan (independent of tracks, but tied to host lifecycle) ---
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -103,28 +121,6 @@ export function InstrumentGeneratorPanel({
         const lib = await loadLibrary(host, DEFAULT_SAMPLE_ROOT);
         if (cancelled) return;
         setLibrary(lib);
-
-        // Reclaim tracks the plugin already owns (e.g. after scene switch).
-        const handles = await host.getPluginTracks();
-        if (cancelled) return;
-        setTracks(handles.map(handle => ({
-          handle,
-          prompt: '',
-          category: '',
-          loadedInstrumentId: null,
-          loadedInstrumentName: null,
-          isGenerating: false,
-          error: null,
-          hasMidi: false,
-          generationProgress: 0,
-          muted: false,
-          solo: false,
-          volume: 0.75,
-          pan: 0,
-          fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
-          fxDrawerOpen: false,
-          shuffleHistory: new Set<string>(),
-        })));
       } catch (err) {
         if (!cancelled) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -133,7 +129,181 @@ export function InstrumentGeneratorPanel({
       }
     })();
     return () => { cancelled = true; };
+  }, [host]);
+
+  // --- Load tracks for the active scene: adopt → list → restore plugin_data ---
+  // Mirrors DrumGeneratorPanel.loadTracks. Without adoptSceneTracks() the host
+  // never re-matches stale engine_track_ids after a project reload, and
+  // getPluginTracks()'s DB fallback drops rows whose engine id is no longer
+  // current. With adoption, plugin_data scoped to scene survives reload too.
+  const loadTracks = useCallback(async (): Promise<void> => {
+    const sceneAtStart = activeSceneId;
+    if (!sceneAtStart) {
+      setTracks([]);
+      tracksLoadedForSceneRef.current = null;
+      return;
+    }
+    if (tracksLoadedForSceneRef.current !== sceneAtStart) {
+      setTracks([]);
+    }
+    tracksLoadedForSceneRef.current = sceneAtStart;
+    const isStale = (): boolean => tracksLoadedForSceneRef.current !== sceneAtStart;
+
+    try {
+      await host.adoptSceneTracks();
+      if (isStale()) return;
+      const handles = await host.getPluginTracks();
+      if (isStale()) return;
+      const sceneData = await host.getAllSceneData(sceneAtStart) as Record<string, unknown>;
+      if (isStale()) return;
+
+      const idMap = new Map<string, string>();
+      for (const h of handles) { idMap.set(h.id, h.dbId); }
+      engineToDbIdRef.current = idMap;
+
+      const trackStates: InstrumentTrackState[] = [];
+      for (const handle of handles) {
+        // Runtime state + hasMidi: ask the engine. Defaults are reasonable
+        // if the call fails (we still want the row to render).
+        let muted = false;
+        let solo = false;
+        let volume = 0.75;
+        let pan = 0;
+        let hasMidi = false;
+        try {
+          const info = await host.getTrackInfo(handle.id);
+          muted = info.muted;
+          solo = info.soloed;
+          volume = info.volume;
+          pan = info.pan;
+          hasMidi = info.hasMidi;
+        } catch {
+          // Use defaults
+        }
+
+        // FX state: fetch lazily so the row renders accurate preset/dry-wet
+        // values when the user opens the drawer. Default to empty until then.
+        let fxDetailState: TrackFxDetailState = { ...EMPTY_FX_DETAIL_STATE };
+        try {
+          const fxState = await host.getTrackFxState(handle.id);
+          fxDetailState = pluginFxToToggleFx(fxState);
+        } catch {
+          // Use defaults
+        }
+
+        const promptKey = `track:${handle.dbId}:prompt`;
+        const categoryKey = `track:${handle.dbId}:category`;
+        const shuffleHistoryKey = `track:${handle.dbId}:shuffleHistory`;
+
+        const prompt = typeof sceneData[promptKey] === 'string'
+          ? sceneData[promptKey] as string
+          : '';
+        // Category falls back to handle.role (set via host.setTrackRole at
+        // generation time) when no scene-data row exists yet.
+        const category = typeof sceneData[categoryKey] === 'string'
+          ? sceneData[categoryKey] as string
+          : (handle.role ?? '');
+        // Shuffle history: stored as string[] in scene data (Sets don't
+        // serialize). Rehydrate into a Set so the shuffle handler can keep
+        // using its existing API.
+        const historyArr = Array.isArray(sceneData[shuffleHistoryKey])
+          ? (sceneData[shuffleHistoryKey] as unknown[]).filter((x): x is string => typeof x === 'string')
+          : [];
+        const shuffleHistory = new Set<string>(historyArr);
+
+        trackStates.push({
+          handle,
+          prompt,
+          category,
+          // tracks.instrument_plugin_id / tracks.instrument_name persist via
+          // host.setTrackInstrumentSampler, so getPluginTracks already hands
+          // these back on reload. No scene-data write needed.
+          loadedInstrumentId: handle.instrumentPluginId ?? null,
+          loadedInstrumentName: handle.instrumentName ?? null,
+          isGenerating: false,
+          error: null,
+          // If the engine reports MIDI clips OR the row has a persisted role
+          // (i.e. the user already generated once), surface the post-generate
+          // UI affordances (shuffle button shows).
+          hasMidi: hasMidi || !!handle.role,
+          generationProgress: 0,
+          muted,
+          solo,
+          volume,
+          pan,
+          fxDetailState,
+          fxDrawerOpen: false,
+          shuffleHistory,
+        });
+      }
+      if (isStale()) return;
+      setTracks(trackStates);
+    } catch (err) {
+      console.error('[InstrumentGeneratorPanel] Failed to load tracks:', err);
+    }
   }, [host, activeSceneId]);
+
+  useEffect(() => {
+    loadTracks();
+  }, [loadTracks]);
+
+  // Keep engineToDbIdRef in sync when handlers (add, generate) mutate tracks
+  // outside the loadTracks path.
+  useEffect(() => {
+    const map = new Map<string, string>();
+    for (const t of tracks) { map.set(t.handle.id, t.handle.dbId); }
+    engineToDbIdRef.current = map;
+  }, [tracks]);
+
+  // Re-adopt when the engine signals it's ready (post-reload, post-project-switch).
+  useEffect(() => {
+    const unsub = host.onEngineReady(() => {
+      loadTracks();
+    });
+    return unsub;
+  }, [host, loadTracks]);
+
+  // Re-adopt when the agent mutates state (chat-plugin tools, CLI). Debounced
+  // 500ms to coalesce bursts. Matches DrumGeneratorPanel pattern.
+  useEffect(() => {
+    if (typeof host.onAfterAgentMutation !== 'function') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsub = host.onAfterAgentMutation(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        loadTracks();
+      }, 500);
+    });
+    return () => {
+      unsub?.();
+      if (timer) clearTimeout(timer);
+    };
+  }, [host, loadTracks]);
+
+  // Mirror engine-pushed runtime state (mute/solo/volume/pan) into the row.
+  // Without this, opening the project shows defaults instead of the .sas-file
+  // values for these controls even when the audio is playing correctly.
+  useEffect(() => {
+    const unsub = host.onTrackStateChange((trackId: string, state: PluginTrackRuntimeState) => {
+      setTracks(prev => prev.map(t =>
+        t.handle.id === trackId
+          ? { ...t, muted: state.muted, solo: state.solo, volume: state.volume, pan: state.pan }
+          : t
+      ));
+    });
+    return unsub;
+  }, [host]);
+
+  // Flush pending prompt-save debounces on unmount.
+  useEffect(() => {
+    const refs = saveTimeoutRefs;
+    return () => {
+      for (const timeout of Object.values(refs.current)) {
+        clearTimeout(timeout);
+      }
+    };
+  }, []);
 
   const availableCategories = useMemo<string[]>(
     () => library?.categories ?? [],
@@ -250,17 +420,35 @@ export function InstrumentGeneratorPanel({
 
   const handlePromptChange = useCallback((trackId: string, prompt: string): void => {
     updateTrack(trackId, { prompt });
-  }, [updateTrack]);
+    // Persist debounced to scene_data so the prompt survives reload. Keyed by
+    // stable DB UUID, not engine id, per Reference Resolver discipline.
+    if (!activeSceneId) return;
+    const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
+    if (saveTimeoutRefs.current[trackId]) {
+      clearTimeout(saveTimeoutRefs.current[trackId]);
+    }
+    saveTimeoutRefs.current[trackId] = setTimeout(() => {
+      host.setSceneData(activeSceneId, `track:${dbId}:prompt`, prompt).catch(() => {});
+    }, 500);
+  }, [updateTrack, host, activeSceneId]);
 
   const handleDeleteTrack = useCallback(async (trackId: string): Promise<void> => {
     try {
+      const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
       await host.deleteTrack(trackId);
+      if (activeSceneId) {
+        // Fire-and-forget — non-fatal if cleanup fails. Keys would persist
+        // harmlessly until the scene itself is deleted.
+        host.deleteSceneData(activeSceneId, `track:${dbId}:prompt`).catch(() => {});
+        host.deleteSceneData(activeSceneId, `track:${dbId}:category`).catch(() => {});
+        host.deleteSceneData(activeSceneId, `track:${dbId}:shuffleHistory`).catch(() => {});
+      }
       setTracks(prev => prev.filter(t => t.handle.id !== trackId));
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
       host.showToast('error', 'Failed to delete track', msg);
     }
-  }, [host]);
+  }, [host, activeSceneId]);
 
   const handleMuteToggle = useCallback(async (trackId: string): Promise<void> => {
     const t = tracks.find(t => t.handle.id === trackId);
@@ -395,6 +583,12 @@ export function InstrumentGeneratorPanel({
         loadedInstrumentName: picked.displayName,
         shuffleHistory: nextHistory,
       });
+      // Persist the updated shuffle history so the cycle resumes (rather
+      // than restarting) after reload.
+      if (activeSceneId) {
+        const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
+        host.setSceneData(activeSceneId, `track:${dbId}:shuffleHistory`, Array.from(nextHistory)).catch(() => {});
+      }
       console.log(
         `[InstrumentGeneratorPanel] shuffle: track ${trackId} → "${picked.displayName}" (${picked.instrumentId}); history ${nextHistory.size}/${library.byCategory.get(category)?.length ?? '?'}; zone[0]=${picked.zones[0]?.samplePath}`
       );
@@ -402,7 +596,7 @@ export function InstrumentGeneratorPanel({
       const msg = err instanceof Error ? err.message : 'Shuffle failed';
       host.showToast('error', 'Shuffle failed', msg);
     }
-  }, [host, tracks, library, updateTrack]);
+  }, [host, tracks, library, updateTrack, activeSceneId]);
 
   // --- Generate: prompt → LLM → MIDI + sampler load ---
   const handleGenerate = useCallback(async (trackId: string): Promise<void> => {
@@ -510,6 +704,21 @@ export function InstrumentGeneratorPanel({
         generationProgress: 0,
         shuffleHistory: freshHistory,
       });
+
+      // Persist category + shuffle history so the row rehydrates on reload.
+      // instrumentPluginId/instrumentName already persist via the
+      // tracks.instrument_plugin_id / tracks.instrument_name columns
+      // (host.setTrackInstrumentSampler writes them); no scene-data mirror.
+      // Prefer track.handle.dbId over the ref to dodge ref-update lag when
+      // generate fires immediately after createTrack.
+      if (activeSceneId) {
+        const genDbId = track.handle.dbId ?? engineToDbIdRef.current.get(trackId) ?? trackId;
+        if (chosenCategory) {
+          host.setSceneData(activeSceneId, `track:${genDbId}:category`, chosenCategory).catch(() => {});
+        }
+        host.setSceneData(activeSceneId, `track:${genDbId}:shuffleHistory`, Array.from(freshHistory)).catch(() => {});
+      }
+
       host.showToast('success', `Generated · ${chosenCategory} · ${loadedInstrumentName ?? '—'}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Generation failed';
