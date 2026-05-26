@@ -7,9 +7,10 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "resolveJsonModule": true,
     "outDir": "dist",
     "declaration": true
   },
-  "include": ["*.ts", "*.tsx", "src/**/*.ts", "src/**/*.tsx"],
+  "include": ["*.ts", "*.tsx", "src/**/*.ts", "src/**/*.tsx", "__tests__/**/*.ts", "__tests__/**/*.tsx"],
   "exclude": ["node_modules", "dist"]
 }

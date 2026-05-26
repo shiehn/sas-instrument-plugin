@@ -28,8 +28,6 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import type {
   PluginUIProps,
   PluginTrackHandle,
-  PluginTrackRuntimeState,
-  PluginMidiNote,
   MidiClipData,
   FxCategory,
   TrackFxDetailState,
@@ -39,13 +37,23 @@ import type {
 import { TrackRow, EMPTY_FX_DETAIL_STATE } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibrary, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
+import { parseLLMInstrumentResponse } from './src/parse-llm-response';
+import { SamplePackCTACard, type SamplePackCardInfo } from '@signalsandsorcery/plugin-sdk';
 
-// Standalone sibling-plugin fallback: the sas-assistant builtin resolves the
-// library root at runtime via host.getSamplePackRoot(...). The sibling
-// doesn't wire that flow yet (would require shared CTA components in the
-// SDK), so it hardcodes the legacy dev path. End users run the in-app
-// builtin; this sibling is a dev scaffold.
-const DEFAULT_SAMPLE_ROOT = '/Users/stevehiehn/Downloads/outputs/instruments';
+type PackStatus = 'checking' | 'missing' | 'stale' | 'current';
+
+// This plugin's sample-pack display identity. The HOST owns the volatile
+// registry (exact size / sha256 / download URL / expected version) keyed by
+// packId — reached via host.isSamplePackCurrent / getSamplePackRoot /
+// getSamplePackInstalledVersion / startSamplePackDownload. The plugin only
+// declares its own packId + the copy shown on the download CTA, so it no
+// longer imports the app's shared/constants/sample-packs (W9 — no back doors).
+const INSTRUMENT_PACK: SamplePackCardInfo = {
+  packId: 'sas-instrument-pack',
+  displayName: 'Instrument Sample Library',
+  description: 'Plucks, basses, pianos, strings — 16 categories, ~1,400 instruments',
+  sizeBytes: 10_381_810_313,
+};
 
 const MAX_TRACKS = 16;
 const ESTIMATED_GENERATION_MS = 15000;
@@ -82,11 +90,6 @@ interface InstrumentTrackState {
   fxDrawerOpen: boolean;
 }
 
-interface LLMInstrumentResponse {
-  notes: PluginMidiNote[];
-  category?: string;
-}
-
 export function InstrumentGeneratorPanel({
   host,
   activeSceneId,
@@ -102,23 +105,57 @@ export function InstrumentGeneratorPanel({
   const [libraryError, setLibraryError] = useState<string | null>(null);
   const [isAddingTrack, setIsAddingTrack] = useState(false);
   const isAddingTrackRef = useRef(false);
-
-  // Engine track id → stable DB UUID. Used to key plugin_data writes by the
-  // DB id (stable across reloads) rather than the engine id (re-assigned
-  // when Tracktion reloads the .sas file). Mirrors SynthGeneratorPanel.
+  // Stable engine-id → DB-id map (rebuilt on load + kept in sync with tracks).
+  // Scene data is keyed by the DB id, which is stable across reloads.
   const engineToDbIdRef = useRef<Map<string, string>>(new Map());
   // Per-track debounce handles for prompt saves.
   const saveTimeoutRefs = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
-  // Tracks which scene the current `tracks` array was loaded for; guards
-  // against scene-switch races when an in-flight load resolves late.
+  // Scene the last loadTracks() pass committed for, so a scene switch (or a
+  // second loadTracks fired by onEngineReady) can no-op the stale pass.
+  // Mirrors DrumGeneratorPanel.tracksLoadedForSceneRef.
   const tracksLoadedForSceneRef = useRef<string | null>(null);
 
-  // --- Library scan (independent of tracks, but tied to host lifecycle) ---
+  // Phase 1.1 (sample pack distribution): pack-status drives the empty-state
+  // CTA vs the normal panel UI. Re-evaluated on mount and after every download
+  // completes (via the pack:progress 'complete' event).
+  const [packStatus, setPackStatus] = useState<PackStatus>('checking');
+  const refreshPackStatus = useCallback(async (): Promise<void> => {
+    const isCurrent = await host.isSamplePackCurrent(INSTRUMENT_PACK.packId).catch(() => false);
+    if (isCurrent) {
+      setPackStatus('current');
+      return;
+    }
+    const installed = await host
+      .getSamplePackInstalledVersion(INSTRUMENT_PACK.packId)
+      .catch(() => null);
+    setPackStatus(installed === null ? 'missing' : 'stale');
+  }, [host]);
   useEffect(() => {
+    void refreshPackStatus();
+    const unsub = host.onSamplePackProgress(INSTRUMENT_PACK.packId, (p) => {
+      if (p.status === 'complete') void refreshPackStatus();
+    });
+    return unsub;
+  }, [refreshPackStatus, host]);
+
+  // --- Library scan (independent of track reclaim) ---
+  // Only runs once the pack is current; otherwise the panel shows the CTA card
+  // and the library stays null until the download completes.
+  useEffect(() => {
+    if (packStatus !== 'current') {
+      setLibrary(null);
+      setLibraryError(null);
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
-        const lib = await loadLibrary(host, DEFAULT_SAMPLE_ROOT);
+        const root = await host.getSamplePackRoot(INSTRUMENT_PACK.packId);
+        if (!root) {
+          setLibraryError('Sample pack root not available');
+          return;
+        }
+        const lib = await loadLibrary(host, root);
         if (cancelled) return;
         setLibrary(lib);
       } catch (err) {
@@ -129,13 +166,16 @@ export function InstrumentGeneratorPanel({
       }
     })();
     return () => { cancelled = true; };
-  }, [host]);
+  }, [host, packStatus]);
 
-  // --- Load tracks for the active scene: adopt → list → restore plugin_data ---
-  // Mirrors DrumGeneratorPanel.loadTracks. Without adoptSceneTracks() the host
-  // never re-matches stale engine_track_ids after a project reload, and
-  // getPluginTracks()'s DB fallback drops rows whose engine id is no longer
-  // current. With adoption, plugin_data scoped to scene survives reload too.
+  // --- Reclaim instrument tracks on this scene ---
+  // Runs on mount/scene-switch AND on host.onEngineReady() (below). The earlier
+  // single-shot version raced the engine: on a project reopen, adoptSceneTracks()
+  // ran while the engine still had 0 tracks loaded ("Adopted 0/4 DB rows"), so
+  // only the tracks whose stale engine_track_id happened to still match got
+  // rendered via getPluginTracks()'s read-only DB fallback — the rest silently
+  // vanished. Re-running once the engine signals ready fixes that. Mirrors
+  // DrumGeneratorPanel.loadTracks.
   const loadTracks = useCallback(async (): Promise<void> => {
     const sceneAtStart = activeSceneId;
     if (!sceneAtStart) {
@@ -143,28 +183,47 @@ export function InstrumentGeneratorPanel({
       tracksLoadedForSceneRef.current = null;
       return;
     }
-    if (tracksLoadedForSceneRef.current !== sceneAtStart) {
-      setTracks([]);
-    }
+    if (packStatus !== 'current') return;
     tracksLoadedForSceneRef.current = sceneAtStart;
     const isStale = (): boolean => tracksLoadedForSceneRef.current !== sceneAtStart;
-
     try {
+      // adoptSceneTracks() rehydrates the host's ownership set (ownedTrackIds)
+      // from tracks.plugin_id. Without it, generate/delete (which assertOwned)
+      // throw NOT_OWNED after a reload even though getPluginTracks() still
+      // renders the rows via its read-only DB fallback.
       await host.adoptSceneTracks();
       if (isStale()) return;
       const handles = await host.getPluginTracks();
       if (isStale()) return;
-      const sceneData = await host.getAllSceneData(sceneAtStart) as Record<string, unknown>;
+      // Restore per-track prompt + category from scene_data (keyed by the stable
+      // DB id — engine ids change across reloads). Without this the prompt field
+      // and category chip come back blank after a project reload.
+      const sceneData = await host.getAllSceneData(sceneAtStart)
+        .catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>;
       if (isStale()) return;
 
       const idMap = new Map<string, string>();
-      for (const h of handles) { idMap.set(h.id, h.dbId); }
+      for (const h of handles) idMap.set(h.id, h.dbId);
       engineToDbIdRef.current = idMap;
 
       const trackStates: InstrumentTrackState[] = [];
       for (const handle of handles) {
-        // Runtime state + hasMidi: ask the engine. Defaults are reasonable
-        // if the call fails (we still want the row to render).
+        const promptKey = `track:${handle.dbId}:prompt`;
+        const categoryKey = `track:${handle.dbId}:category`;
+        const prompt = typeof sceneData[promptKey] === 'string'
+          ? sceneData[promptKey] as string
+          : '';
+        // Category falls back to handle.role (persisted via setTrackRole at
+        // generate-time) so the chip survives even when scene_data is absent.
+        const category = typeof sceneData[categoryKey] === 'string'
+          ? sceneData[categoryKey] as string
+          : (handle.role ?? '');
+
+        // Restore runtime state + MIDI presence from the engine/DB. hasMidi
+        // gates the shuffle/copy/instrument buttons in TrackRow — without it a
+        // reloaded (already-generated) track renders with its controls greyed
+        // out and looks "inactive". Self-heal from role for rows the DB hasn't
+        // flagged with MIDI yet. Mirrors DrumGeneratorPanel.loadTracks.
         let muted = false;
         let solo = false;
         let volume = 0.75;
@@ -178,62 +237,27 @@ export function InstrumentGeneratorPanel({
           pan = info.pan;
           hasMidi = info.hasMidi;
         } catch {
-          // Use defaults
+          // Non-fatal — keep defaults.
         }
-
-        // FX state: fetch lazily so the row renders accurate preset/dry-wet
-        // values when the user opens the drawer. Default to empty until then.
-        let fxDetailState: TrackFxDetailState = { ...EMPTY_FX_DETAIL_STATE };
-        try {
-          const fxState = await host.getTrackFxState(handle.id);
-          fxDetailState = pluginFxToToggleFx(fxState);
-        } catch {
-          // Use defaults
-        }
-
-        const promptKey = `track:${handle.dbId}:prompt`;
-        const categoryKey = `track:${handle.dbId}:category`;
-        const shuffleHistoryKey = `track:${handle.dbId}:shuffleHistory`;
-
-        const prompt = typeof sceneData[promptKey] === 'string'
-          ? sceneData[promptKey] as string
-          : '';
-        // Category falls back to handle.role (set via host.setTrackRole at
-        // generation time) when no scene-data row exists yet.
-        const category = typeof sceneData[categoryKey] === 'string'
-          ? sceneData[categoryKey] as string
-          : (handle.role ?? '');
-        // Shuffle history: stored as string[] in scene data (Sets don't
-        // serialize). Rehydrate into a Set so the shuffle handler can keep
-        // using its existing API.
-        const historyArr = Array.isArray(sceneData[shuffleHistoryKey])
-          ? (sceneData[shuffleHistoryKey] as unknown[]).filter((x): x is string => typeof x === 'string')
-          : [];
-        const shuffleHistory = new Set<string>(historyArr);
+        if (!hasMidi && handle.role) hasMidi = true;
 
         trackStates.push({
           handle,
           prompt,
           category,
-          // tracks.instrument_plugin_id / tracks.instrument_name persist via
-          // host.setTrackInstrumentSampler, so getPluginTracks already hands
-          // these back on reload. No scene-data write needed.
-          loadedInstrumentId: handle.instrumentPluginId ?? null,
-          loadedInstrumentName: handle.instrumentName ?? null,
+          loadedInstrumentId: null,
+          loadedInstrumentName: null,
           isGenerating: false,
           error: null,
-          // If the engine reports MIDI clips OR the row has a persisted role
-          // (i.e. the user already generated once), surface the post-generate
-          // UI affordances (shuffle button shows).
-          hasMidi: hasMidi || !!handle.role,
+          hasMidi,
           generationProgress: 0,
           muted,
           solo,
           volume,
           pan,
-          fxDetailState,
+          fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
           fxDrawerOpen: false,
-          shuffleHistory,
+          shuffleHistory: new Set<string>(),
         });
       }
       if (isStale()) return;
@@ -241,69 +265,27 @@ export function InstrumentGeneratorPanel({
     } catch (err) {
       console.error('[InstrumentGeneratorPanel] Failed to load tracks:', err);
     }
-  }, [host, activeSceneId]);
+  }, [host, activeSceneId, packStatus]);
 
   useEffect(() => {
-    loadTracks();
+    void loadTracks();
   }, [loadTracks]);
 
-  // Keep engineToDbIdRef in sync when handlers (add, generate) mutate tracks
-  // outside the loadTracks path.
+  // Re-adopt when the engine finishes (re)loading a project. On reopen the
+  // engine populates its track list asynchronously, so the initial loadTracks()
+  // above can run before any engine tracks exist. Mirrors DrumGeneratorPanel.
+  useEffect(() => {
+    const unsub = host.onEngineReady(() => { void loadTracks(); });
+    return unsub;
+  }, [host, loadTracks]);
+
+  // Keep the engine-id → DB-id map current as tracks are added/removed so
+  // prompt saves (keyed by DB id) resolve for freshly-added tracks too.
   useEffect(() => {
     const map = new Map<string, string>();
-    for (const t of tracks) { map.set(t.handle.id, t.handle.dbId); }
+    for (const t of tracks) map.set(t.handle.id, t.handle.dbId);
     engineToDbIdRef.current = map;
   }, [tracks]);
-
-  // Re-adopt when the engine signals it's ready (post-reload, post-project-switch).
-  useEffect(() => {
-    const unsub = host.onEngineReady(() => {
-      loadTracks();
-    });
-    return unsub;
-  }, [host, loadTracks]);
-
-  // Re-adopt when the agent mutates state (chat-plugin tools, CLI). Debounced
-  // 500ms to coalesce bursts. Matches DrumGeneratorPanel pattern.
-  useEffect(() => {
-    if (typeof host.onAfterAgentMutation !== 'function') return;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const unsub = host.onAfterAgentMutation(() => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        timer = null;
-        loadTracks();
-      }, 500);
-    });
-    return () => {
-      unsub?.();
-      if (timer) clearTimeout(timer);
-    };
-  }, [host, loadTracks]);
-
-  // Mirror engine-pushed runtime state (mute/solo/volume/pan) into the row.
-  // Without this, opening the project shows defaults instead of the .sas-file
-  // values for these controls even when the audio is playing correctly.
-  useEffect(() => {
-    const unsub = host.onTrackStateChange((trackId: string, state: PluginTrackRuntimeState) => {
-      setTracks(prev => prev.map(t =>
-        t.handle.id === trackId
-          ? { ...t, muted: state.muted, solo: state.solo, volume: state.volume, pan: state.pan }
-          : t
-      ));
-    });
-    return unsub;
-  }, [host]);
-
-  // Flush pending prompt-save debounces on unmount.
-  useEffect(() => {
-    const refs = saveTimeoutRefs;
-    return () => {
-      for (const timeout of Object.values(refs.current)) {
-        clearTimeout(timeout);
-      }
-    };
-  }, []);
 
   const availableCategories = useMemo<string[]>(
     () => library?.categories ?? [],
@@ -327,7 +309,7 @@ export function InstrumentGeneratorPanel({
     }
     if (tracks.length >= MAX_TRACKS) return;
     if (availableCategories.length === 0) {
-      host.showToast('warning', 'Empty library', `No instruments found under ${DEFAULT_SAMPLE_ROOT}/instruments. Run the sample pipeline first.`);
+      host.showToast('warning', 'Empty library', 'No instruments found in the installed pack.');
       return;
     }
 
@@ -374,6 +356,13 @@ export function InstrumentGeneratorPanel({
   // track (which would generate nothing useful without contract context).
   useEffect(() => {
     if (!onHeaderContent) return;
+    // Phase 1.1: hide "+ Add" until the sample pack is installed — the
+    // panel body shows a CTA card in that state and adding tracks would
+    // produce silent ones.
+    if (packStatus !== 'current') {
+      onHeaderContent(null);
+      return () => { onHeaderContent(null); };
+    }
     const addDisabled =
       needsContract
       || !isConnected
@@ -409,7 +398,7 @@ export function InstrumentGeneratorPanel({
       </div>
     );
     return () => { onHeaderContent(null); };
-  }, [onHeaderContent, sceneContext, isConnected, isAddingTrack,
+  }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       needsContract, activeSceneId, tracks.length, availableCategories.length,
       handleAddTrack, onOpenContract]);
 
@@ -421,12 +410,10 @@ export function InstrumentGeneratorPanel({
   const handlePromptChange = useCallback((trackId: string, prompt: string): void => {
     updateTrack(trackId, { prompt });
     // Persist debounced to scene_data so the prompt survives reload. Keyed by
-    // stable DB UUID, not engine id, per Reference Resolver discipline.
+    // the stable DB id, per the drum panel's pattern.
     if (!activeSceneId) return;
     const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
-    if (saveTimeoutRefs.current[trackId]) {
-      clearTimeout(saveTimeoutRefs.current[trackId]);
-    }
+    if (saveTimeoutRefs.current[trackId]) clearTimeout(saveTimeoutRefs.current[trackId]);
     saveTimeoutRefs.current[trackId] = setTimeout(() => {
       host.setSceneData(activeSceneId, `track:${dbId}:prompt`, prompt).catch(() => {});
     }, 500);
@@ -437,11 +424,9 @@ export function InstrumentGeneratorPanel({
       const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
       await host.deleteTrack(trackId);
       if (activeSceneId) {
-        // Fire-and-forget — non-fatal if cleanup fails. Keys would persist
-        // harmlessly until the scene itself is deleted.
-        host.deleteSceneData(activeSceneId, `track:${dbId}:prompt`).catch(() => {});
-        host.deleteSceneData(activeSceneId, `track:${dbId}:category`).catch(() => {});
-        host.deleteSceneData(activeSceneId, `track:${dbId}:shuffleHistory`).catch(() => {});
+        // Clean up persisted prompt/category for the deleted track.
+        await host.deleteSceneData(activeSceneId, `track:${dbId}:prompt`).catch(() => {});
+        await host.deleteSceneData(activeSceneId, `track:${dbId}:category`).catch(() => {});
       }
       setTracks(prev => prev.filter(t => t.handle.id !== trackId));
     } catch (err) {
@@ -539,6 +524,22 @@ export function InstrumentGeneratorPanel({
     }
   }, [host, tracks]);
 
+  // --- Duplicate track: new instance with the same MIDI + same instrument/sample.
+  // Mirrors DrumGeneratorPanel.handleCopy. host.duplicateTrack copies the MIDI
+  // clips and the sampler state; loadTracks restores the copy's category from
+  // its role, so the Shuffle button below works on the copy — that's how the
+  // user thickens the sound (copy, then shuffle the copy to a different sample).
+  const handleCopy = useCallback(async (trackId: string): Promise<void> => {
+    try {
+      const newHandle = await host.duplicateTrack(trackId);
+      await loadTracks();
+      host.showToast('success', 'Track duplicated', newHandle.name);
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Copy failed';
+      host.showToast('error', 'Copy failed', msg);
+    }
+  }, [host, loadTracks]);
+
   // --- Shuffle: swap the loaded instrument for a different one in the same category ---
   // Mirrors DrumGeneratorPanel.tsx:660. Only meaningful after Generate has populated
   // track.category; TrackRow gates the button on hasMidi so this is safe to wire
@@ -583,12 +584,6 @@ export function InstrumentGeneratorPanel({
         loadedInstrumentName: picked.displayName,
         shuffleHistory: nextHistory,
       });
-      // Persist the updated shuffle history so the cycle resumes (rather
-      // than restarting) after reload.
-      if (activeSceneId) {
-        const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
-        host.setSceneData(activeSceneId, `track:${dbId}:shuffleHistory`, Array.from(nextHistory)).catch(() => {});
-      }
       console.log(
         `[InstrumentGeneratorPanel] shuffle: track ${trackId} → "${picked.displayName}" (${picked.instrumentId}); history ${nextHistory.size}/${library.byCategory.get(category)?.length ?? '?'}; zone[0]=${picked.zones[0]?.samplePath}`
       );
@@ -596,7 +591,7 @@ export function InstrumentGeneratorPanel({
       const msg = err instanceof Error ? err.message : 'Shuffle failed';
       host.showToast('error', 'Shuffle failed', msg);
     }
-  }, [host, tracks, library, updateTrack, activeSceneId]);
+  }, [host, tracks, library, updateTrack]);
 
   // --- Generate: prompt → LLM → MIDI + sampler load ---
   const handleGenerate = useCallback(async (trackId: string): Promise<void> => {
@@ -666,6 +661,12 @@ export function InstrumentGeneratorPanel({
           console.warn('[InstrumentGeneratorPanel] setTrackRole failed:', err);
         }
       }
+      // Persist category to scene_data (keyed by the stable DB id) so the
+      // category chip is restored on reload alongside the prompt.
+      if (activeSceneId && chosenCategory) {
+        const genDbId = engineToDbIdRef.current.get(trackId) ?? trackId;
+        host.setSceneData(activeSceneId, `track:${genDbId}:category`, chosenCategory).catch(() => {});
+      }
 
       // Pick a random instrument from the matching category and load it.
       const picked = pickInstrument(library, chosenCategory);
@@ -704,28 +705,13 @@ export function InstrumentGeneratorPanel({
         generationProgress: 0,
         shuffleHistory: freshHistory,
       });
-
-      // Persist category + shuffle history so the row rehydrates on reload.
-      // instrumentPluginId/instrumentName already persist via the
-      // tracks.instrument_plugin_id / tracks.instrument_name columns
-      // (host.setTrackInstrumentSampler writes them); no scene-data mirror.
-      // Prefer track.handle.dbId over the ref to dodge ref-update lag when
-      // generate fires immediately after createTrack.
-      if (activeSceneId) {
-        const genDbId = track.handle.dbId ?? engineToDbIdRef.current.get(trackId) ?? trackId;
-        if (chosenCategory) {
-          host.setSceneData(activeSceneId, `track:${genDbId}:category`, chosenCategory).catch(() => {});
-        }
-        host.setSceneData(activeSceneId, `track:${genDbId}:shuffleHistory`, Array.from(freshHistory)).catch(() => {});
-      }
-
       host.showToast('success', `Generated · ${chosenCategory} · ${loadedInstrumentName ?? '—'}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Generation failed';
       updateTrack(trackId, { isGenerating: false, error: msg, generationProgress: 0 });
       host.showToast('error', 'Generation failed', msg);
     }
-  }, [host, tracks, isAuthenticated, library, availableCategories, updateTrack]);
+  }, [host, tracks, isAuthenticated, library, availableCategories, updateTrack, activeSceneId]);
 
   // --- Render ---
 
@@ -745,16 +731,21 @@ export function InstrumentGeneratorPanel({
     );
   }
 
+  if (packStatus !== 'current') {
+    return (
+      <SamplePackCTACard
+        host={host}
+        pack={INSTRUMENT_PACK}
+        status={packStatus}
+        onDownloadComplete={refreshPackStatus}
+      />
+    );
+  }
+
   return (
     <div data-testid="instrument-section" className="p-2 space-y-2">
       {libraryError && (
         <div className="text-xs text-red-400 px-2 py-1">{libraryError}</div>
-      )}
-
-      {library && availableCategories.length === 0 && (
-        <div className="text-xs opacity-60 px-2 py-1">
-          No instruments found under {DEFAULT_SAMPLE_ROOT}/instruments. Generate samples first.
-        </div>
       )}
 
       {tracks.map(track => (
@@ -778,6 +769,7 @@ export function InstrumentGeneratorPanel({
           estimatedGenerationMs={ESTIMATED_GENERATION_MS}
           onPromptChange={(p: string) => handlePromptChange(track.handle.id, p)}
           onGenerate={() => handleGenerate(track.handle.id)}
+          onCopy={() => handleCopy(track.handle.id)}
           onShuffle={() => handleShuffle(track.handle.id)}
           onFxToggle={(cat: FxCategory, en: boolean) => handleFxToggle(track.handle.id, cat, en)}
           onFxPresetChange={(cat: FxCategory, idx: number) => handleFxPresetChange(track.handle.id, cat, idx)}
@@ -792,70 +784,13 @@ export function InstrumentGeneratorPanel({
           instrumentName={track.loadedInstrumentName}
         />
       ))}
-
-      {availableCategories.length > 0 && (
-        <div className="text-[10px] opacity-50 px-1">
-          {availableCategories.length} {availableCategories.length === 1 ? 'category' : 'categories'} discovered: {availableCategories.join(', ')}
-        </div>
-      )}
     </div>
   );
 }
 
-/**
- * Parse the LLM's JSON response, tolerating ```json fences and validating
- * note fields. Mirrors the drum plugin's parser but with `category`
- * (singular, dynamic) instead of role+subRole.
- */
-function parseLLMInstrumentResponse(content: string): LLMInstrumentResponse | null {
-  try {
-    let jsonStr = content.trim();
-    const fenceMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-    if (fenceMatch) {
-      jsonStr = fenceMatch[1].trim();
-    }
-
-    const parsed: unknown = JSON.parse(jsonStr);
-    if (typeof parsed !== 'object' || parsed === null || !('notes' in parsed)) {
-      return null;
-    }
-
-    const obj = parsed as Record<string, unknown>;
-    if (!Array.isArray(obj.notes)) {
-      return null;
-    }
-
-    const validNotes: PluginMidiNote[] = [];
-    for (const raw of obj.notes) {
-      if (typeof raw !== 'object' || raw === null) continue;
-      const note = raw as Record<string, unknown>;
-
-      const pitch = typeof note.pitch === 'number' ? note.pitch : NaN;
-      const startBeat = typeof note.startBeat === 'number' ? note.startBeat : NaN;
-      const durationBeats = typeof note.durationBeats === 'number' ? note.durationBeats : NaN;
-      const velocity = typeof note.velocity === 'number' ? note.velocity : NaN;
-
-      if (
-        !isNaN(pitch) && pitch >= 0 && pitch <= 127
-        && !isNaN(startBeat) && startBeat >= 0
-        && !isNaN(durationBeats) && durationBeats > 0
-        && !isNaN(velocity) && velocity >= 1 && velocity <= 127
-      ) {
-        validNotes.push({
-          pitch: Math.round(pitch),
-          startBeat,
-          durationBeats,
-          velocity: Math.round(velocity),
-        });
-      }
-    }
-
-    const category = typeof obj.category === 'string' ? obj.category : undefined;
-    return { notes: validNotes, category };
-  } catch {
-    return null;
-  }
-}
+// parseLLMInstrumentResponse + LLMInstrumentResponse extracted to
+// ./src/parse-llm-response.ts (shared with the agent-facing generate_instrument
+// skill in src/main/services/plugin-skill-handlers.ts).
 
 /**
  * Convert the SDK's PluginTrackFxDetailState (fetched via host.getTrackFxState)
