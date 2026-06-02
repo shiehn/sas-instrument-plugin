@@ -34,7 +34,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useSoundHistory } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useSoundHistory, type TrackSoundHistory } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibrary, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -139,7 +139,16 @@ export function InstrumentGeneratorPanel({
     },
     [host],
   );
-  const soundHistory = useSoundHistory(applyInstrumentSound);
+  // Persist the per-track history to project scene-data so it survives reopen.
+  const persistSoundHistory = useCallback(
+    (trackId: string, state: TrackSoundHistory): void => {
+      if (!activeSceneId) return;
+      const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
+      host.setSceneData(activeSceneId, `track:${dbId}:soundHistory`, state).catch(() => {});
+    },
+    [host, activeSceneId],
+  );
+  const soundHistory = useSoundHistory(applyInstrumentSound, { onChange: persistSoundHistory });
 
   // Phase 1.1 (sample pack distribution): pack-status drives the empty-state
   // CTA vs the normal panel UI. Re-evaluated on mount and after every download
@@ -300,6 +309,14 @@ export function InstrumentGeneratorPanel({
       }
       if (isStale()) return;
       setTracks(trackStates);
+      // Restore persisted history so it survives reopen (instruments have no
+      // on-load sound to seed otherwise — history starts at the first generate).
+      for (const ts of trackStates) {
+        const persisted = sceneData[`track:${ts.handle.dbId}:soundHistory`];
+        if (persisted && typeof persisted === 'object') {
+          soundHistory.restore(ts.handle.id, persisted as TrackSoundHistory);
+        }
+      }
     } catch (err) {
       console.error('[InstrumentGeneratorPanel] Failed to load tracks:', err);
     }
@@ -457,7 +474,7 @@ export function InstrumentGeneratorPanel({
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       needsContract, activeSceneId, tracks.length, availableCategories.length,
-      handleAddTrack, onOpenContract, host, onExpandSelf]);
+      handleAddTrack, onOpenContract, host]);
 
   // --- Per-track state updates ---
   const updateTrack = useCallback((trackId: string, patch: Partial<InstrumentTrackState>) => {
@@ -876,11 +893,10 @@ export function InstrumentGeneratorPanel({
           // category/prompt flow chooses instruments, not a VST picker).
           onToggleInstrumentDrawer={() => handleToggleHistoryDrawer(track.handle.id)}
           instrumentDrawerOpen={track.instrumentDrawerOpen}
-          onUndoShuffle={() => { void soundHistory.undo(track.handle.id); }}
-          canUndoShuffle={soundHistory.canUndo(track.handle.id)}
           soundHistory={soundHistory.list(track.handle.id).entries}
           soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
           onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
+          onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
         />
       ))}
     </div>
