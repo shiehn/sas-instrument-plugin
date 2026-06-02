@@ -34,7 +34,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, EMPTY_FX_DETAIL_STATE } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useSoundHistory } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibrary, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -93,6 +93,8 @@ interface InstrumentTrackState {
   // handleFx* callbacks; reverted on host-call failure.
   fxDetailState: TrackFxDetailState;
   fxDrawerOpen: boolean;
+  /** The ▾ "Sound" drawer (History-only for instruments). */
+  instrumentDrawerOpen: boolean;
 }
 
 export function InstrumentGeneratorPanel({
@@ -109,6 +111,7 @@ export function InstrumentGeneratorPanel({
   const [library, setLibrary] = useState<InstrumentLibrary | null>(null);
   const [libraryError, setLibraryError] = useState<string | null>(null);
   const [isAddingTrack, setIsAddingTrack] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const isAddingTrackRef = useRef(false);
   // Stable engine-id → DB-id map (rebuilt on load + kept in sync with tracks).
   // Scene data is keyed by the DB id, which is stable across reloads.
@@ -119,6 +122,24 @@ export function InstrumentGeneratorPanel({
   // second loadTracks fired by onEngineReady) can no-op the stale pass.
   // Mirrors DrumGeneratorPanel.tracksLoadedForSceneRef.
   const tracksLoadedForSceneRef = useRef<string | null>(null);
+
+  // --- Sound history (↩ back-arrow + drawer "History" tab) --------------
+  // An instrument "sound" is its { displayName, zones }. Re-applying loads it
+  // into the multi-zone sampler (not persisted to scene-data — mirrors the
+  // existing shuffle, which relies on the engine's saved sampler state).
+  const applyInstrumentSound = useCallback(
+    async (trackId: string, descriptor: unknown): Promise<void> => {
+      const d = descriptor as { displayName: string; instrumentId: string | null; zones: ResolvedInstrument['zones'] };
+      await host.setTrackInstrumentSampler(trackId, { name: d.displayName, zones: d.zones });
+      setTracks((prev) => prev.map((t) => (
+        t.handle.id === trackId
+          ? { ...t, loadedInstrumentId: d.instrumentId, loadedInstrumentName: d.displayName }
+          : t
+      )));
+    },
+    [host],
+  );
+  const soundHistory = useSoundHistory(applyInstrumentSound);
 
   // Phase 1.1 (sample pack distribution): pack-status drives the empty-state
   // CTA vs the normal panel UI. Re-evaluated on mount and after every download
@@ -199,6 +220,8 @@ export function InstrumentGeneratorPanel({
     }
     if (packStatus !== 'current') return;
     tracksLoadedForSceneRef.current = sceneAtStart;
+    // Reset sound-history on a full reload so history resets per scene/reopen.
+    soundHistory.reset();
     const isStale = (): boolean => tracksLoadedForSceneRef.current !== sceneAtStart;
     try {
       // adoptSceneTracks() rehydrates the host's ownership set (ownedTrackIds)
@@ -271,6 +294,7 @@ export function InstrumentGeneratorPanel({
           pan,
           fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
           fxDrawerOpen: false,
+          instrumentDrawerOpen: false,
           shuffleHistory: new Set<string>(),
         });
       }
@@ -279,7 +303,7 @@ export function InstrumentGeneratorPanel({
     } catch (err) {
       console.error('[InstrumentGeneratorPanel] Failed to load tracks:', err);
     }
-  }, [host, activeSceneId, packStatus]);
+  }, [host, activeSceneId, packStatus, soundHistory]);
 
   useEffect(() => {
     void loadTracks();
@@ -352,6 +376,7 @@ export function InstrumentGeneratorPanel({
         pan: 0,
         fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
         fxDrawerOpen: false,
+        instrumentDrawerOpen: false,
         shuffleHistory: new Set<string>(),
       }]);
       onExpandSelf?.();
@@ -387,6 +412,24 @@ export function InstrumentGeneratorPanel({
 
     onHeaderContent(
       <div className="flex gap-1">
+        {host.listImportableTracks && (
+          <button
+            data-testid="import-from-scene-instruments-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              onExpandSelf?.();
+              setImportOpen(true);
+            }}
+            disabled={!activeSceneId || needsContract}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              !activeSceneId || needsContract
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+          >
+            Import
+          </button>
+        )}
         <button
           data-testid="add-instrument-track-button"
           onClick={(e: React.MouseEvent) => {
@@ -414,7 +457,7 @@ export function InstrumentGeneratorPanel({
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       needsContract, activeSceneId, tracks.length, availableCategories.length,
-      handleAddTrack, onOpenContract]);
+      handleAddTrack, onOpenContract, host, onExpandSelf]);
 
   // --- Per-track state updates ---
   const updateTrack = useCallback((trackId: string, patch: Partial<InstrumentTrackState>) => {
@@ -554,6 +597,15 @@ export function InstrumentGeneratorPanel({
     }
   }, [host, loadTracks]);
 
+  // Toggle the per-track ▾ drawer (History-only for instruments — no instrument picker).
+  const handleToggleHistoryDrawer = useCallback((trackId: string): void => {
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId
+        ? { ...t, instrumentDrawerOpen: !t.instrumentDrawerOpen, fxDrawerOpen: false }
+        : t
+    ));
+  }, []);
+
   // --- Shuffle: swap the loaded instrument for a different one in the same category ---
   // Mirrors DrumGeneratorPanel.tsx:660. Only meaningful after Generate has populated
   // track.category; TrackRow gates the button on hasMidi so this is safe to wire
@@ -598,6 +650,12 @@ export function InstrumentGeneratorPanel({
         loadedInstrumentName: picked.displayName,
         shuffleHistory: nextHistory,
       });
+      // Record the new sound so the ↩ back-arrow + History tab can return to it.
+      soundHistory.record(
+        trackId,
+        { displayName: picked.displayName, instrumentId: picked.instrumentId, zones: picked.zones },
+        picked.displayName,
+      );
       console.log(
         `[InstrumentGeneratorPanel] shuffle: track ${trackId} → "${picked.displayName}" (${picked.instrumentId}); history ${nextHistory.size}/${library.byCategory.get(category)?.length ?? '?'}; zone[0]=${picked.zones[0]?.samplePath}`
       );
@@ -605,7 +663,7 @@ export function InstrumentGeneratorPanel({
       const msg = err instanceof Error ? err.message : 'Shuffle failed';
       host.showToast('error', 'Shuffle failed', msg);
     }
-  }, [host, tracks, library, updateTrack]);
+  }, [host, tracks, library, updateTrack, soundHistory]);
 
   // --- Generate: prompt → LLM → MIDI + sampler load ---
   const handleGenerate = useCallback(async (trackId: string): Promise<void> => {
@@ -719,13 +777,22 @@ export function InstrumentGeneratorPanel({
         generationProgress: 0,
         shuffleHistory: freshHistory,
       });
+      // Generation is a fresh baseline — start sound-history over at this instrument.
+      soundHistory.clear(trackId);
+      if (picked) {
+        soundHistory.record(
+          trackId,
+          { displayName: picked.displayName, instrumentId: picked.instrumentId, zones: picked.zones },
+          picked.displayName,
+        );
+      }
       host.showToast('success', `Generated · ${chosenCategory} · ${loadedInstrumentName ?? '—'}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Generation failed';
       updateTrack(trackId, { isGenerating: false, error: msg, generationProgress: 0 });
       host.showToast('error', 'Generation failed', msg);
     }
-  }, [host, tracks, isAuthenticated, library, availableCategories, updateTrack, activeSceneId]);
+  }, [host, tracks, isAuthenticated, library, availableCategories, updateTrack, activeSceneId, soundHistory]);
 
   // --- Render ---
 
@@ -758,6 +825,15 @@ export function InstrumentGeneratorPanel({
 
   return (
     <div data-testid="instrument-section" className="p-2 space-y-2">
+      {host.listImportableTracks && (
+        <ImportTrackModal
+          host={host}
+          open={importOpen}
+          onClose={() => setImportOpen(false)}
+          onImported={() => { void loadTracks(); }}
+          testIdPrefix="instruments-import"
+        />
+      )}
       {libraryError && (
         <div className="text-xs text-red-400 px-2 py-1">{libraryError}</div>
       )}
@@ -796,6 +872,15 @@ export function InstrumentGeneratorPanel({
           onPanChange={(p: number) => handlePanChange(track.handle.id, p)}
           accentColor={INSTRUMENT_ACCENT_COLOR}
           instrumentName={track.loadedInstrumentName}
+          // ▾ opens a History-only drawer (no instrument PICKER — the panel's
+          // category/prompt flow chooses instruments, not a VST picker).
+          onToggleInstrumentDrawer={() => handleToggleHistoryDrawer(track.handle.id)}
+          instrumentDrawerOpen={track.instrumentDrawerOpen}
+          onUndoShuffle={() => { void soundHistory.undo(track.handle.id); }}
+          canUndoShuffle={soundHistory.canUndo(track.handle.id)}
+          soundHistory={soundHistory.list(track.handle.id).entries}
+          soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
+          onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
         />
       ))}
     </div>
