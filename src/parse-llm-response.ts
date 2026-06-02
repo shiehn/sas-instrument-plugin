@@ -16,6 +16,14 @@ import type { PluginMidiNote } from '@signalsandsorcery/plugin-sdk';
 export interface LLMInstrumentResponse {
   notes: PluginMidiNote[];
   category?: string;
+  /**
+   * Optional short sonic descriptor (timbre/character) the LLM derives by
+   * translating the user's request into concrete sample-vocabulary words
+   * ("1950s" → "vintage warm valve"). Used to pick the closest-matching
+   * instrument within the category; absent → caller falls back to the raw
+   * request.
+   */
+  sound?: string;
 }
 
 export function parseLLMInstrumentResponse(content: string): LLMInstrumentResponse | null {
@@ -62,7 +70,10 @@ export function parseLLMInstrumentResponse(content: string): LLMInstrumentRespon
     }
 
     const category = typeof obj.category === 'string' ? obj.category : undefined;
-    return { notes: validNotes, category };
+    const sound = typeof obj.sound === 'string' && obj.sound.trim().length > 0
+      ? obj.sound.trim()
+      : undefined;
+    return { notes: validNotes, category, sound };
   } catch {
     return null;
   }

@@ -39,6 +39,7 @@
  * to re-scan.
  */
 
+import { scorePromptMatch, pickTopKWeighted } from '@signalsandsorcery/plugin-sdk';
 import type { PluginHost, InstrumentZone } from '@signalsandsorcery/plugin-sdk';
 import type { InstrumentManifest } from './manifest-types';
 
@@ -69,27 +70,121 @@ export interface InstrumentLibrary {
 }
 
 /**
- * Pick a random ResolvedInstrument from the given category, excluding
- * any whose `instrumentId` is in `excludeIds`. Returns null when the
- * filtered pool is empty (either category empty OR caller has used
- * every entry — the panel uses the null signal to reset its shuffle
- * history and call again with an empty exclude set).
+ * Options for a query-aware instrument pick. Passing a bare
+ * `ReadonlySet<string>` (the historical second argument) is still accepted
+ * and treated as `excludeIds`, so existing callers keep working unchanged.
+ */
+export interface PickInstrumentOptions {
+  /** Shuffle history — instrumentIds to skip. */
+  excludeIds?: ReadonlySet<string>;
+  /**
+   * Free-text intent ("warm vintage upright piano"). When supplied AND the
+   * instruments carry non-empty prompts, the pick is biased toward the
+   * closest-matching instrument (top-k weighted). With no query, empty
+   * prompts (legacy packs), or no token overlap, selection stays uniform
+   * random — identical to the historical behavior.
+   */
+  query?: string;
+  /** Injectable RNG in [0, 1) for deterministic tests (default Math.random). */
+  rng?: () => number;
+}
+
+/**
+ * Pick a ResolvedInstrument from the given category, excluding any whose
+ * `instrumentId` is in `excludeIds`. Returns null when the filtered pool is
+ * empty (either category empty OR caller has used every entry — the panel
+ * uses the null signal to reset its shuffle history and call again with an
+ * empty exclude set), or if the category is unknown.
  *
- * Returns null if the category is unknown.
+ * The second argument is either a `ReadonlySet<string>` of instrumentIds to
+ * exclude (the historical shape) or a {@link PickInstrumentOptions} object
+ * that can additionally carry a `query` to bias the pick semantically.
  */
 export function pickInstrument(
   library: InstrumentLibrary,
   categoryId: string,
-  excludeIds?: ReadonlySet<string>,
+  options?: ReadonlySet<string> | PickInstrumentOptions,
 ): ResolvedInstrument | null {
+  const { excludeIds, query, rng = Math.random } =
+    options instanceof Set
+      ? ({ excludeIds: options as ReadonlySet<string> } as PickInstrumentOptions)
+      : ((options as PickInstrumentOptions) ?? {});
+
   const pool = library.byCategory.get(categoryId);
   if (!pool || pool.length === 0) return null;
   const filtered = excludeIds && excludeIds.size > 0
     ? pool.filter(p => !excludeIds.has(p.instrumentId))
     : pool;
   if (filtered.length === 0) return null;
-  const idx = Math.floor(Math.random() * filtered.length);
+
+  // Semantic pick: bias toward the instrument whose prompt best matches the
+  // query. No query, empty prompts (legacy packs), or no token overlap →
+  // falls through to the uniform-random pick below.
+  const trimmedQuery = query?.trim();
+  if (trimmedQuery) {
+    const scores = scorePromptMatch(trimmedQuery, filtered.map(inst => inst.prompt));
+    const maxScore = scores.reduce((m, s) => Math.max(m, s), 0);
+    if (maxScore > 0) {
+      const picked = pickTopKWeighted(
+        filtered.map((inst, i) => ({ item: inst, score: scores[i], key: inst.instrumentId })),
+        { rng },
+      );
+      if (picked) return picked;
+    }
+  }
+
+  const idx = Math.floor(rng() * filtered.length);
   return filtered[idx];
+}
+
+/**
+ * Module-level cache of the loaded library, keyed by categoriesRoot and
+ * validated against the pack's `_pack-version.json` version. The instrument
+ * library is project-INDEPENDENT (the pack is global) and expensive to scan —
+ * v3 is 28 categories / ~5,475 manifest folders over ~77k files. Without this
+ * cache the full scan re-ran on EVERY generate / shuffle (a multi-second stall
+ * each time); with it only the first load after launch — or a pack-version
+ * change — pays the cost. Concurrent first-loads are deduped via the promise.
+ */
+const libraryCache = new Map<string, { version: string; promise: Promise<InstrumentLibrary> }>();
+
+/**
+ * Drop cached libraries (all, or just one root). A pack version bump
+ * invalidates on its own; call this after a re-install at the SAME version.
+ */
+export function invalidateInstrumentLibraryCache(root?: string): void {
+  if (root) libraryCache.delete(root);
+  else libraryCache.clear();
+}
+
+/** Read the installed pack's version marker (cheap — one small file). '' if absent. */
+async function readPackVersion(host: PluginHost, root: string): Promise<string> {
+  try {
+    const raw = await host.readTextFile(joinPath(root, '_pack-version.json'));
+    if (!raw) return '';
+    const v = (JSON.parse(raw) as { version?: unknown }).version;
+    return typeof v === 'string' ? v : '';
+  } catch {
+    return '';
+  }
+}
+
+/** Run `fn` over `items` with at most `limit` concurrent calls, preserving order. */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < items.length; i = next++) {
+      results[i] = await fn(items[i], i);
+    }
+  };
+  const n = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return results;
 }
 
 /**
@@ -97,18 +192,33 @@ export function pickInstrument(
  * are category folders (plucks/, basses/, pianos/, ...). Returns an empty
  * library if the root doesn't exist or no audio files were found.
  *
- * Phase 1.1 (sample-pack distribution): the pack zip already structures its
- * payload as `<category>/<id>/...` so the install root (`<userData>/samples/instruments/`)
- * IS the categoriesRoot. Previously this function appended `/instruments` to
- * accommodate the dev layout `~/Downloads/outputs/instruments/`; callers
- * should now pass the categories-parent directly.
+ * The result is CACHED per-root and reused until the pack's `_pack-version.json`
+ * version changes, so repeated generate/shuffle calls don't re-scan thousands
+ * of manifests. Phase 1.1: the pack zip structures its payload as
+ * `<category>/<id>/...` so the install root IS the categoriesRoot.
  */
 export async function loadLibrary(host: PluginHost, categoriesRoot: string): Promise<InstrumentLibrary> {
-  // Alias kept so the function body below (existing variable names + log
-  // strings) doesn't churn. categoriesRoot is the new external name; locally
-  // we still call it instrumentsRoot.
-  const instrumentsRoot = categoriesRoot;
+  const version = await readPackVersion(host, categoriesRoot);
+  const cached = libraryCache.get(categoriesRoot);
+  if (cached && version !== '' && cached.version === version) {
+    return cached.promise;
+  }
 
+  const promise = buildLibrary(host, categoriesRoot);
+  // Only cache against a real version marker; evict a failed build so the next
+  // call retries instead of caching an empty/partial library forever.
+  if (version !== '') {
+    libraryCache.set(categoriesRoot, { version, promise });
+    promise.catch(() => {
+      const cur = libraryCache.get(categoriesRoot);
+      if (cur && cur.promise === promise) libraryCache.delete(categoriesRoot);
+    });
+  }
+  return promise;
+}
+
+/** The actual filesystem scan + manifest parse (uncached; see {@link loadLibrary}). */
+async function buildLibrary(host: PluginHost, instrumentsRoot: string): Promise<InstrumentLibrary> {
   // Single recursive scan finds every sample under every category, at every depth.
   // listAudioFiles silently returns [] for a missing root — no try/catch needed.
   const samplePaths = await host.listAudioFiles(instrumentsRoot, {
@@ -128,7 +238,7 @@ export async function loadLibrary(host: PluginHost, categoriesRoot: string): Pro
   //
   // For the flat case we synthesize an instrument inline.
   // For the subdir case we collect (category, subdir) pairs to look up manifests.
-  const all: ResolvedInstrument[] = [];
+  const flatSpecs: { categoryId: string; filename: string }[] = [];
   const manifestFolders = new Set<string>(); // "<category>/<subdir>"
 
   for (const samplePath of samplePaths) {
@@ -141,56 +251,71 @@ export async function loadLibrary(host: PluginHost, categoriesRoot: string): Pro
     const categoryId = segments[0];
 
     if (segments.length === 2) {
-      // Flat shape: <category>/<filename>
-      const filename = segments[1];
-      all.push(await buildFlatInstrument(host, instrumentsRoot, categoryId, filename));
+      // Flat shape: <category>/<filename> — collect; built in parallel below.
+      flatSpecs.push({ categoryId, filename: segments[1] });
     } else {
       // Manifest-folder shape: <category>/<subdir>/...
       manifestFolders.add(`${categoryId}/${segments[1]}`);
     }
   }
 
-  // One read per unique manifest folder.
-  for (const folderKey of manifestFolders) {
-    const [categoryId, subdir] = folderKey.split('/');
-    const manifestDir = joinPath(instrumentsRoot, categoryId, subdir);
-    const manifestPath = joinPath(manifestDir, 'manifest.json');
-    const raw = await host.readTextFile(manifestPath);
-    if (raw === null) {
-      console.warn(`[instrument-resolver] Skipping ${manifestPath}: no readable manifest.json`);
-      continue;
-    }
+  // Read manifests + build flat instruments with bounded concurrency — a v3 cold
+  // load is ~5,475 manifest reads; sequential awaits made it a multi-second stall.
+  const READ_CONCURRENCY = 96;
+  const all: ResolvedInstrument[] = await mapWithConcurrency(
+    flatSpecs,
+    READ_CONCURRENCY,
+    (spec) => buildFlatInstrument(host, instrumentsRoot, spec.categoryId, spec.filename),
+  );
 
-    let manifest: InstrumentManifest;
-    try {
-      manifest = JSON.parse(raw) as InstrumentManifest;
-    } catch (err) {
-      console.warn(`[instrument-resolver] Skipping ${manifestPath}: ${(err as Error).message}`);
-      continue;
-    }
+  // One read per unique manifest folder — bounded-concurrent (see READ_CONCURRENCY).
+  const built = await mapWithConcurrency(
+    Array.from(manifestFolders),
+    READ_CONCURRENCY,
+    async (folderKey): Promise<ResolvedInstrument | null> => {
+      const [categoryId, subdir] = folderKey.split('/');
+      const manifestDir = joinPath(instrumentsRoot, categoryId, subdir);
+      const manifestPath = joinPath(manifestDir, 'manifest.json');
+      const raw = await host.readTextFile(manifestPath);
+      if (raw === null) {
+        console.warn(`[instrument-resolver] Skipping ${manifestPath}: no readable manifest.json`);
+        return null;
+      }
 
-    if (manifest.schema_version !== 1 || !Array.isArray(manifest.zones) || manifest.zones.length === 0) {
-      console.warn(`[instrument-resolver] Skipping ${manifestPath}: invalid schema or no zones`);
-      continue;
-    }
+      let manifest: InstrumentManifest;
+      try {
+        manifest = JSON.parse(raw) as InstrumentManifest;
+      } catch (err) {
+        console.warn(`[instrument-resolver] Skipping ${manifestPath}: ${(err as Error).message}`);
+        return null;
+      }
 
-    const zones: InstrumentZone[] = manifest.zones.map(z => ({
-      samplePath: resolveZonePath(manifestDir, z.sample),
-      rootKey: z.root_midi,
-      minKey: z.min_midi,
-      maxKey: z.max_midi,
-      openEnded: manifest.open_ended,
-    }));
+      if (manifest.schema_version !== 1 || !Array.isArray(manifest.zones) || manifest.zones.length === 0) {
+        console.warn(`[instrument-resolver] Skipping ${manifestPath}: invalid schema or no zones`);
+        return null;
+      }
 
-    all.push({
-      categoryId,
-      categoryDisplay: manifest.category_display || titleCase(categoryId),
-      instrumentId: manifest.instrument_id,
-      displayName: deriveDisplayName(manifest.prompt, manifest.instrument_id),
-      prompt: manifest.prompt,
-      zones,
-      manifestDir,
-    });
+      const zones: InstrumentZone[] = manifest.zones.map(z => ({
+        samplePath: resolveZonePath(manifestDir, z.sample),
+        rootKey: z.root_midi,
+        minKey: z.min_midi,
+        maxKey: z.max_midi,
+        openEnded: manifest.open_ended,
+      }));
+
+      return {
+        categoryId,
+        categoryDisplay: manifest.category_display || titleCase(categoryId),
+        instrumentId: manifest.instrument_id,
+        displayName: deriveDisplayName(manifest.prompt, manifest.instrument_id),
+        prompt: manifest.prompt,
+        zones,
+        manifestDir,
+      };
+    },
+  );
+  for (const inst of built) {
+    if (inst) all.push(inst);
   }
 
   const byCategory = new Map<string, ResolvedInstrument[]>();

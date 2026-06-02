@@ -35,7 +35,8 @@ Respond with ONLY a JSON object in this format:
   "notes": [
     { "pitch": 60, "startBeat": 0, "durationBeats": 1.0, "velocity": 96 }
   ],
-  "category": "plucks"
+  "category": "plucks",
+  "sound": "warm vintage valve mellow"
 }
 
 Rules:
@@ -45,6 +46,7 @@ Rules:
 - velocity: 1-127. Use velocity to shape phrasing — accents, dynamics, ghost notes. Avoid constant velocity across a whole phrase.
 - Polyphony: multiple simultaneous notes are fine and encouraged for chords, dyads, two-handed textures. The sampler voice-allocates per-note.
 - category: MUST be one of: ${categoryList}. Pick the single best fit for the user's request. If the user names a specific category (e.g. "warm pad") use that; otherwise infer from instrument cues ("guitar", "synth", "bass").
+- sound: a SHORT phrase (3-8 words) describing the desired TIMBRE / CHARACTER of the instrument. The plugin matches it against a library of per-instrument text descriptions to pick the closest-sounding one. Translate era / genre / mood cues into concrete sonic words: "1950s" → "vintage warm valve mellow", "ambient" → "lush airy evolving pad", "aggressive lead" → "bright cutting detuned saw". Describe tone / material / era / character only — NOT which notes to play. Omit the field only when the request implies no particular timbre.
 
 Style guidance:
 - Match the bar count and tempo from the musical context.

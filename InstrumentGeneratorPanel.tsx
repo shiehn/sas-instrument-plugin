@@ -48,11 +48,16 @@ type PackStatus = 'checking' | 'missing' | 'stale' | 'current';
 // getSamplePackInstalledVersion / startSamplePackDownload. The plugin only
 // declares its own packId + the copy shown on the download CTA, so it no
 // longer imports the app's shared/constants/sample-packs (W9 — no back doors).
+//
+// The description/sizeBytes below are a STATIC FALLBACK only — at runtime the
+// panel pulls the live copy from host.getSamplePackInfo (SDK 2.12+) so the CTA
+// matches whatever bundle the host actually ships. Kept current for hosts that
+// predate getSamplePackInfo.
 const INSTRUMENT_PACK: SamplePackCardInfo = {
   packId: 'sas-instrument-pack',
   displayName: 'Instrument Sample Library',
-  description: 'Plucks, basses, pianos, strings — 16 categories, ~1,400 instruments',
-  sizeBytes: 10_381_810_313,
+  description: '28 categories, ~5,475 instruments — basses, leads, keys, plucks, strings, mallets, choir & more',
+  sizeBytes: 28_547_320_229,
 };
 
 const MAX_TRACKS = 16;
@@ -119,6 +124,9 @@ export function InstrumentGeneratorPanel({
   // CTA vs the normal panel UI. Re-evaluated on mount and after every download
   // completes (via the pack:progress 'complete' event).
   const [packStatus, setPackStatus] = useState<PackStatus>('checking');
+  // Live CTA copy (size/description). Seeded with the static fallback, then
+  // overwritten by the host registry so it tracks the shipped bundle.
+  const [packInfo, setPackInfo] = useState<SamplePackCardInfo>(INSTRUMENT_PACK);
   const refreshPackStatus = useCallback(async (): Promise<void> => {
     const isCurrent = await host.isSamplePackCurrent(INSTRUMENT_PACK.packId).catch(() => false);
     if (isCurrent) {
@@ -132,6 +140,12 @@ export function InstrumentGeneratorPanel({
   }, [host]);
   useEffect(() => {
     void refreshPackStatus();
+    // Pull the canonical size/description from the host registry (SDK 2.12+);
+    // optional-chained so older hosts simply keep the static fallback.
+    void host.getSamplePackInfo?.(INSTRUMENT_PACK.packId)?.then(
+      (info) => { if (info) setPackInfo(info); },
+      () => {},
+    );
     const unsub = host.onSamplePackProgress(INSTRUMENT_PACK.packId, (p) => {
       if (p.status === 'complete') void refreshPackStatus();
     });
@@ -735,7 +749,7 @@ export function InstrumentGeneratorPanel({
     return (
       <SamplePackCTACard
         host={host}
-        pack={INSTRUMENT_PACK}
+        pack={packInfo}
         status={packStatus}
         onDownloadComplete={refreshPackStatus}
       />
