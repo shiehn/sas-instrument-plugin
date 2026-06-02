@@ -112,6 +112,7 @@ export function InstrumentGeneratorPanel({
   const [libraryError, setLibraryError] = useState<string | null>(null);
   const [isAddingTrack, setIsAddingTrack] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [soundImportTarget, setSoundImportTarget] = useState<InstrumentTrackState | null>(null);
   const isAddingTrackRef = useRef(false);
   // Stable engine-id → DB-id map (rebuilt on load + kept in sync with tracks).
   // Scene data is keyed by the DB id, which is stable across reloads.
@@ -149,6 +150,32 @@ export function InstrumentGeneratorPanel({
     [host, activeSceneId],
   );
   const soundHistory = useSoundHistory(applyInstrumentSound, { onChange: persistSoundHistory });
+
+  // Import just the instrument SAMPLE (zones) from a track in another scene
+  // (drawer "Import Sample"), bypassing the contract gate. Read the source
+  // sound via host.getTrackSound, then apply + record it (undoable, persisted).
+  const handleSoundImportPick = useCallback(
+    async (sel: { sourceTrackDbId: string; trackName: string; sceneName: string }): Promise<void> => {
+      const target = soundImportTarget;
+      if (!target || !host.getTrackSound) { setSoundImportTarget(null); return; }
+      try {
+        const snap = await host.getTrackSound(sel.sourceTrackDbId);
+        if (!snap || snap.kind !== 'instrument') {
+          host.showToast('error', 'No sample to import', `${sel.trackName} has no instrument sound.`);
+          return;
+        }
+        const descriptor = { displayName: snap.displayName, instrumentId: snap.instrumentId, zones: snap.zones };
+        await applyInstrumentSound(target.handle.id, descriptor);
+        soundHistory.record(target.handle.id, descriptor, snap.label);
+        host.showToast('success', 'Sample imported', `${snap.label} → ${target.handle.name}`);
+      } catch (err: unknown) {
+        host.showToast('error', 'Import failed', err instanceof Error ? err.message : String(err));
+      } finally {
+        setSoundImportTarget(null);
+      }
+    },
+    [soundImportTarget, host, applyInstrumentSound, soundHistory],
+  );
 
   // Phase 1.1 (sample pack distribution): pack-status drives the empty-state
   // CTA vs the normal panel UI. Re-evaluated on mount and after every download
@@ -444,7 +471,7 @@ export function InstrumentGeneratorPanel({
                 : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
             }`}
           >
-            Import
+            Import Track
           </button>
         )}
         <button
@@ -467,7 +494,7 @@ export function InstrumentGeneratorPanel({
               : 'Create a new instrument track'
           }
         >
-          + Add
+          Add Track
         </button>
       </div>
     );
@@ -851,6 +878,18 @@ export function InstrumentGeneratorPanel({
           testIdPrefix="instruments-import"
         />
       )}
+      {host.listImportableTracks && host.getTrackSound && (
+        <ImportTrackModal
+          host={host}
+          mode="sound"
+          open={!!soundImportTarget}
+          title="Import Sample"
+          onClose={() => setSoundImportTarget(null)}
+          onImported={() => {}}
+          onPick={handleSoundImportPick}
+          testIdPrefix="instruments-sound-import"
+        />
+      )}
       {libraryError && (
         <div className="text-xs text-red-400 px-2 py-1">{libraryError}</div>
       )}
@@ -897,6 +936,8 @@ export function InstrumentGeneratorPanel({
           soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
           onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
           onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
+          onImportSound={() => setSoundImportTarget(track)}
+          importSoundLabel="Import Sample"
         />
       ))}
     </div>
