@@ -29,12 +29,13 @@ import type {
   PluginUIProps,
   PluginTrackHandle,
   MidiClipData,
+  PluginMidiNote,
   FxCategory,
   TrackFxDetailState,
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useSoundHistory, type TrackSoundHistory } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibrary, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -84,6 +85,13 @@ interface InstrumentTrackState {
   error: string | null;
   hasMidi: boolean;
   generationProgress: number;
+  // Piano-roll edit state. `editNotes` is the live, editable copy of the
+  // track's MIDI (loaded lazily when the Edit tab is first opened, or seeded
+  // from a fresh generation). `editBars`/`editBpm` size the grid + the save
+  // span. See loadEditNotes / handleNotesChange.
+  editNotes: PluginMidiNote[];
+  editBars: number;
+  editBpm: number;
   // Volume/pan/mute/solo — local state only, kept in sync with host.
   muted: boolean;
   solo: boolean;
@@ -120,6 +128,10 @@ export function InstrumentGeneratorPanel({
   const engineToDbIdRef = useRef<Map<string, string>>(new Map());
   // Per-track debounce handles for prompt saves.
   const saveTimeoutRefs = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // Tracks whose Edit-tab MIDI has been fetched (or seeded by a generation),
+  // so re-opening the tab doesn't re-fetch and clobber unsaved edits. A ref,
+  // not state — toggling it must never trigger a re-render.
+  const editLoadStartedRef = useRef<Set<string>>(new Set());
   // Scene the last loadTracks() pass committed for, so a scene switch (or a
   // second loadTracks fired by onEngineReady) can no-op the stale pass.
   // Mirrors DrumGeneratorPanel.tracksLoadedForSceneRef.
@@ -151,6 +163,14 @@ export function InstrumentGeneratorPanel({
     [host, activeSceneId],
   );
   const soundHistory = useSoundHistory(applyInstrumentSound, { onChange: persistSoundHistory });
+
+  // Drag-to-reorder rows (shared SDK hook; persists per-scene by stable dbId).
+  const reorder = useTrackReorder<InstrumentTrackState>({
+    host,
+    items: tracks,
+    setItems: setTracks,
+    getId: (t) => t.handle.dbId,
+  });
 
   // Import just the instrument SAMPLE (zones) from a track in another scene
   // (drawer "Import Sample"), bypassing the contract gate. Read the source
@@ -325,6 +345,9 @@ export function InstrumentGeneratorPanel({
           error: null,
           hasMidi,
           generationProgress: 0,
+          editNotes: [],
+          editBars: 4,
+          editBpm: 120,
           muted,
           solo,
           volume,
@@ -369,6 +392,15 @@ export function InstrumentGeneratorPanel({
     for (const t of tracks) map.set(t.handle.id, t.handle.dbId);
     engineToDbIdRef.current = map;
   }, [tracks]);
+
+  // Clear any pending debounced saves (prompt + piano-roll edit) on unmount so
+  // a timer can't fire host.setSceneData / writeMidiClip after we're gone.
+  useEffect(() => {
+    const timers = saveTimeoutRefs.current;
+    return () => {
+      for (const id of Object.values(timers)) clearTimeout(id);
+    };
+  }, []);
 
   const availableCategories = useMemo<string[]>(
     () => library?.categories ?? [],
@@ -415,6 +447,9 @@ export function InstrumentGeneratorPanel({
         error: null,
         hasMidi: false,
         generationProgress: 0,
+        editNotes: [],
+        editBars: 4,
+        editBpm: 120,
         muted: false,
         solo: false,
         volume: 0.75,
@@ -629,6 +664,55 @@ export function InstrumentGeneratorPanel({
     }
   }, [host, tracks]);
 
+  // --- Piano-roll edit (load on first open, debounced save) ---
+  // Lazily fetch the track's current MIDI the first time the Edit tab opens.
+  // Reads LIVE engine state via host.readMidiNotes (optional method — older
+  // hosts simply get an empty editor). bars/bpm come from the musical context
+  // so the grid + save span match the scene.
+  const loadEditNotes = useCallback(async (trackId: string): Promise<void> => {
+    try {
+      const mc = await host.getMusicalContext();
+      let notes: PluginMidiNote[] = [];
+      if (typeof host.readMidiNotes === 'function') {
+        const result = await host.readMidiNotes(trackId);
+        notes = result.clips[0]?.notes ?? [];
+      }
+      updateTrack(trackId, { editNotes: notes, editBars: mc.bars, editBpm: mc.bpm });
+    } catch (err: unknown) {
+      console.warn('[InstrumentGeneratorPanel] Failed to load MIDI for editing:', err);
+    }
+  }, [host, updateTrack]);
+
+  // Every piano-roll edit: optimistic state update + debounced persist. Reads
+  // bars/bpm inside the timeout (not from track state) so the callback stays
+  // stable on [host] and we never write a stale span. Empty clip → clearMidi
+  // (writeMidiClip throws INVALID_MIDI on zero notes).
+  const handleNotesChange = useCallback((trackId: string, notes: PluginMidiNote[]): void => {
+    updateTrack(trackId, { editNotes: notes });
+    const key = `edit:${trackId}`;
+    if (saveTimeoutRefs.current[key]) clearTimeout(saveTimeoutRefs.current[key]);
+    saveTimeoutRefs.current[key] = setTimeout(() => {
+      void (async (): Promise<void> => {
+        try {
+          if (notes.length === 0) {
+            await host.clearMidi(trackId);
+          } else {
+            const mc = await host.getMusicalContext();
+            await host.writeMidiClip(trackId, {
+              startTime: 0,
+              endTime: (mc.bars * 4 * 60) / mc.bpm,
+              tempo: mc.bpm,
+              notes,
+            });
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          host.showToast('error', 'Failed to save edit', msg);
+        }
+      })();
+    }, 300);
+  }, [host, updateTrack]);
+
   // Tab-strip clicks: switch the active tab, keeping the drawer open.
   const handleTabChange = useCallback((trackId: string, tab: DrawerTab): void => {
     setTracks(prev => prev.map(t =>
@@ -640,8 +724,11 @@ export function InstrumentGeneratorPanel({
           t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
         ));
       }).catch(() => {});
+    } else if (tab === 'edit' && !editLoadStartedRef.current.has(trackId)) {
+      editLoadStartedRef.current.add(trackId);
+      void loadEditNotes(trackId);
     }
-  }, [host]);
+  }, [host, loadEditNotes]);
 
   // --- Duplicate track: new instance with the same MIDI + same instrument/sample.
   // Mirrors DrumGeneratorPanel.handleCopy. host.duplicateTrack copies the MIDI
@@ -744,9 +831,24 @@ export function InstrumentGeneratorPanel({
     updateTrack(trackId, { isGenerating: true, error: null, generationProgress: 0 });
 
     try {
+      // Musical context (key/bpm/bars/chords/contract) is auto-prefixed by
+      // the SDK. We also pull the generation context so the LLM can SEE the
+      // other tracks' MIDI (bass, chords, drums) and voice this instrument to
+      // sit with them — without it a pad/pluck is composed blind to the scene.
       const musicalContext = await host.getMusicalContext();
+      const generationContext = await host.getGenerationContext(trackId);
+      const concurrentBlock = formatConcurrentTracks(generationContext);
 
-      const userPrompt = `User request: "${track.prompt}"\n\nGenerate a pitched MIDI clip for a sample-based instrument that fits this context.`;
+      const promptParts: string[] = [];
+      if (concurrentBlock) {
+        promptParts.push(concurrentBlock, '');
+      }
+      promptParts.push(
+        `User request: "${track.prompt}"`,
+        ``,
+        `Generate a pitched MIDI clip for a sample-based instrument that fits this context.`,
+      );
+      const userPrompt = promptParts.join('\n');
 
       const llmResult = await host.generateWithLLM({
         system: buildInstrumentSystemPrompt(availableCategories),
@@ -839,7 +941,13 @@ export function InstrumentGeneratorPanel({
         hasMidi: true,
         generationProgress: 0,
         shuffleHistory: freshHistory,
+        // Seed the piano-roll's editable copy from the just-generated notes so
+        // opening the Edit tab needs no round-trip (and won't clobber these).
+        editNotes: processedNotes,
+        editBars: musicalContext.bars,
+        editBpm: musicalContext.bpm,
       });
+      editLoadStartedRef.current.add(trackId);
       // Generation is a fresh baseline — start sound-history over at this instrument.
       soundHistory.clear(trackId);
       if (picked) {
@@ -913,9 +1021,10 @@ export function InstrumentGeneratorPanel({
         <div className="text-xs text-red-400 px-2 py-1">{libraryError}</div>
       )}
 
-      {tracks.map(track => (
+      {tracks.map((track, index) => (
         <TrackRow
           key={track.handle.id}
+          drag={reorder.dragPropsFor(index)}
           track={{ id: track.handle.id, name: track.handle.name, role: track.category }}
           prompt={track.prompt}
           runtimeState={{
@@ -958,6 +1067,12 @@ export function InstrumentGeneratorPanel({
           onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
           onImportSound={() => setSoundImportTarget(track)}
           importSoundLabel="Import Sample"
+          editNotes={track.editNotes}
+          onNotesChange={(notes) => handleNotesChange(track.handle.id, notes)}
+          editBars={track.editBars}
+          editBpm={track.editBpm}
+          editSnap={0.25}
+          onAuditionNote={(pitch, vel, ms) => { void host.auditionNote(track.handle.id, pitch, vel, ms); }}
         />
       ))}
     </div>

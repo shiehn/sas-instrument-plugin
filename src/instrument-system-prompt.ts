@@ -51,6 +51,7 @@ Rules:
 Style guidance:
 - Match the bar count and tempo from the musical context.
 - Respect any chord/contract hints in the musical context — voice notes consistent with the chord progression at each beat.
+- If "Concurrent tracks in scene" are listed, compose to COMPLEMENT them: lock to the bassline's root motion, avoid clashing with notes already sounding, and leave rhythmic space rather than doubling another part.
 - For monophonic instruments (basses, plucks, leads) emit one note at a time; for polyphonic (pads, keys, organs) chords are welcome.
 - Keep one track focused on one role — don't switch categories mid-clip.`;
 }
