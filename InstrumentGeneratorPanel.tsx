@@ -35,7 +35,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibrary, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -163,6 +163,8 @@ export function InstrumentGeneratorPanel({
     [host, activeSceneId],
   );
   const soundHistory = useSoundHistory(applyInstrumentSound, { onChange: persistSoundHistory });
+  // Cross-panel: dim non-soloed rows when ANY track (any panel) is soloed.
+  const anySolo = useAnySolo(host);
 
   // Drag-to-reorder rows (shared SDK hook; persists per-scene by stable dbId).
   const reorder = useTrackReorder<InstrumentTrackState>({
@@ -468,6 +470,58 @@ export function InstrumentGeneratorPanel({
       setIsAddingTrack(false);
     }
   }, [host, tracks.length, isConnected, isAuthenticated, availableCategories, onExpandSelf]);
+
+  // Cross-panel import ("re-sound a part on a sampled instrument"): pull a MIDI
+  // part out of a track owned by ANOTHER panel in THIS scene and play it on a
+  // fresh sampler. The sound never carries across families — that's the point —
+  // so we create our own track, copy only the MIDI, then load a role-matched
+  // instrument exactly like the generate path does. createTrack registers
+  // ownership synchronously, so the owned writes below are safe.
+  const handlePortTrack = useCallback(
+    async (sel: { sourceTrackDbId: string; trackName: string; role?: string }): Promise<void> => {
+      if (!activeSceneId) { host.showToast('warning', 'Select SCENE'); return; }
+      if (!isConnected) { host.showToast('warning', 'Systems not connected'); return; }
+      if (tracks.length >= MAX_TRACKS) { host.showToast('warning', 'Track limit reached'); return; }
+      if (availableCategories.length === 0) { host.showToast('warning', 'Empty library', 'No instruments found in the installed pack.'); return; }
+      if (!host.readImportableTrackMidi) return;
+      let handle: PluginTrackHandle | null = null;
+      try {
+        handle = await host.createTrack({ name: `instrument-${Date.now()}` });
+        const midi = await host.readImportableTrackMidi(sel.sourceTrackDbId);
+        const notes = midi.clips[0]?.notes ?? [];
+        if (notes.length > 0) {
+          const mc = await host.getMusicalContext();
+          await host.writeMidiClip(handle.id, {
+            startTime: 0,
+            endTime: (mc.bars * 4 * 60) / mc.bpm,
+            tempo: mc.bpm,
+            notes,
+          });
+        }
+        // Map the ported role to a real instrument category (same fallback the
+        // generate path uses when the LLM names an unknown category).
+        const requested = sel.role ?? '';
+        const chosenCategory = availableCategories.includes(requested) ? requested : (availableCategories[0] ?? '');
+        if (chosenCategory) {
+          try { await host.setTrackRole(handle.id, chosenCategory); } catch { /* non-fatal */ }
+          const dbId = engineToDbIdRef.current.get(handle.id) ?? handle.id;
+          host.setSceneData(activeSceneId, `track:${dbId}:category`, chosenCategory).catch(() => {});
+          const picked = library ? pickInstrument(library, chosenCategory) : null;
+          if (picked) {
+            const descriptor = { displayName: picked.displayName, instrumentId: picked.instrumentId, zones: picked.zones };
+            await applyInstrumentSound(handle.id, descriptor);
+            soundHistory.record(handle.id, descriptor, picked.displayName);
+          }
+        }
+        host.showToast('success', 'Imported to instrument', notes.length ? `${sel.trackName} → instrument` : `${sel.trackName} (no MIDI yet)`);
+        await loadTracks();
+      } catch (err: unknown) {
+        if (handle) { try { await host.deleteTrack(handle.id); } catch { /* best effort */ } }
+        host.showToast('error', 'Import failed', err instanceof Error ? err.message : String(err));
+      }
+    },
+    [host, activeSceneId, isConnected, tracks.length, availableCategories, library, applyInstrumentSound, soundHistory, loadTracks],
+  );
 
   // --- Header content: "+ Add" button rendered up in the accordion strip.
   // Mirrors drum-generator's pattern. When no contract exists the button
@@ -1002,6 +1056,7 @@ export function InstrumentGeneratorPanel({
           open={importOpen}
           onClose={() => setImportOpen(false)}
           onImported={() => { void loadTracks(); }}
+          onPortTrack={host.readImportableTrackMidi ? handlePortTrack : undefined}
           testIdPrefix="instruments-import"
         />
       )}
@@ -1033,6 +1088,7 @@ export function InstrumentGeneratorPanel({
             volume: track.volume,
             pan: track.pan,
           }}
+          soloedOut={anySolo && !track.solo}
           fxDetailState={track.fxDetailState}
           drawerOpen={track.drawerOpen}
           drawerTab={track.drawerTab}
