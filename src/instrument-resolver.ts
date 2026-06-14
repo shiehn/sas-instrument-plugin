@@ -58,6 +58,8 @@ export interface ResolvedInstrument {
   zones: InstrumentZone[];
   /** Folder absolute path holding this instrument — for diagnostics. */
   manifestDir: string;
+  /** Which root this came from — 'user' for an imported pack. Set by loadLibraries. */
+  origin?: 'distributed' | 'user';
 }
 
 export interface InstrumentLibrary {
@@ -215,6 +217,47 @@ export async function loadLibrary(host: PluginHost, categoriesRoot: string): Pro
     });
   }
   return promise;
+}
+
+/**
+ * Load + MERGE several library roots into one, tagging each instrument with its
+ * `origin`. The distributed pack and every user-imported pack are independent
+ * roots (each with its own `_pack-version.json` cache key); this scans them all
+ * (reusing the per-root cache in {@link loadLibrary}) and unions the results, so
+ * the panel sees one combined library. A root that fails to load is skipped
+ * (its pack just doesn't contribute), never fatal to the others.
+ */
+export async function loadLibraries(
+  host: PluginHost,
+  roots: ReadonlyArray<{ path: string; origin: 'distributed' | 'user' }>,
+): Promise<InstrumentLibrary> {
+  const libs = await Promise.all(
+    roots.map(async ({ path, origin }) => {
+      try {
+        const lib = await loadLibrary(host, path);
+        // Tag origin without mutating the cached objects' shared identity in a
+        // way that matters — origin is stable per root, so a shallow copy keeps
+        // the cache clean.
+        return lib.all.map((inst) => (inst.origin === origin ? inst : { ...inst, origin }));
+      } catch (err) {
+        console.warn(`[instrument-resolver] Skipping root ${path}:`, err);
+        return [] as ResolvedInstrument[];
+      }
+    }),
+  );
+
+  const all: ResolvedInstrument[] = libs.flat();
+  const byCategory = new Map<string, ResolvedInstrument[]>();
+  for (const inst of all) {
+    const list = byCategory.get(inst.categoryId) ?? [];
+    list.push(inst);
+    byCategory.set(inst.categoryId, list);
+  }
+  for (const list of byCategory.values()) {
+    list.sort((a, b) => a.displayName.localeCompare(b.displayName));
+  }
+  const categories = Array.from(byCategory.keys()).sort();
+  return { categories, byCategory, all };
 }
 
 /** The actual filesystem scan + manifest parse (uncached; see {@link loadLibrary}). */

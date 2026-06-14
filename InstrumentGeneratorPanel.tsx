@@ -37,7 +37,7 @@ import type {
 } from '@signalsandsorcery/plugin-sdk';
 import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
-import { loadLibrary, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
+import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
 import { SamplePackCTACard, type SamplePackCardInfo } from '@signalsandsorcery/plugin-sdk';
 
@@ -204,6 +204,9 @@ export function InstrumentGeneratorPanel({
   // CTA vs the normal panel UI. Re-evaluated on mount and after every download
   // completes (via the pack:progress 'complete' event).
   const [packStatus, setPackStatus] = useState<PackStatus>('checking');
+  // Local-samples: count of user-imported instrument packs. When > 0 the panel
+  // works even without the stock pack (the resolver merges the user roots in).
+  const [userPackCount, setUserPackCount] = useState(0);
   // Live CTA copy (size/description). Seeded with the static fallback, then
   // overwritten by the host registry so it tracks the shipped bundle.
   const [packInfo, setPackInfo] = useState<SamplePackCardInfo>(INSTRUMENT_PACK);
@@ -232,11 +235,28 @@ export function InstrumentGeneratorPanel({
     return unsub;
   }, [refreshPackStatus, host]);
 
+  // Local-samples: track user-imported instrument packs + invalidate the
+  // resolver cache on every `user:instruments` library broadcast so a freshly
+  // imported pack shows up without an app restart.
+  const refreshUserPacks = useCallback(async (): Promise<void> => {
+    const roots = (await host.getUserSampleRoots?.('instruments')?.catch(() => [])) ?? [];
+    setUserPackCount(roots.length);
+    for (const r of roots) invalidateInstrumentLibraryCache(r);
+  }, [host]);
+  useEffect(() => {
+    void refreshUserPacks();
+    const unsub = host.onSamplePackProgress('user:instruments', (p) => {
+      if (p.status === 'complete') void refreshUserPacks();
+    });
+    return unsub;
+  }, [refreshUserPacks, host]);
+
   // --- Library scan (independent of track reclaim) ---
   // Only runs once the pack is current; otherwise the panel shows the CTA card
   // and the library stays null until the download completes.
   useEffect(() => {
-    if (packStatus !== 'current') {
+    // Load whenever ANY library is available — the stock pack OR ≥1 user pack.
+    if (packStatus !== 'current' && userPackCount === 0) {
       setLibrary(null);
       setLibraryError(null);
       return;
@@ -244,14 +264,22 @@ export function InstrumentGeneratorPanel({
     let cancelled = false;
     (async () => {
       try {
-        const root = await host.getSamplePackRoot(INSTRUMENT_PACK.packId);
-        if (!root) {
+        const roots: Array<{ path: string; origin: 'distributed' | 'user' }> = [];
+        if (packStatus === 'current') {
+          const root = await host.getSamplePackRoot(INSTRUMENT_PACK.packId).catch(() => null);
+          if (root) roots.push({ path: root, origin: 'distributed' });
+        }
+        const userRoots = (await host.getUserSampleRoots?.('instruments')?.catch(() => [])) ?? [];
+        for (const r of userRoots) roots.push({ path: r, origin: 'user' });
+
+        if (roots.length === 0) {
           setLibraryError('Sample pack root not available');
           return;
         }
-        const lib = await loadLibrary(host, root);
+        const lib = await loadLibraries(host, roots);
         if (cancelled) return;
         setLibrary(lib);
+        setLibraryError(null);
       } catch (err) {
         if (!cancelled) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -260,7 +288,7 @@ export function InstrumentGeneratorPanel({
       }
     })();
     return () => { cancelled = true; };
-  }, [host, packStatus]);
+  }, [host, packStatus, userPackCount]);
 
   // --- Reclaim instrument tracks on this scene ---
   // Runs on mount/scene-switch AND on host.onEngineReady() (below). The earlier
@@ -277,7 +305,7 @@ export function InstrumentGeneratorPanel({
       tracksLoadedForSceneRef.current = null;
       return;
     }
-    if (packStatus !== 'current') return;
+    if (packStatus !== 'current' && userPackCount === 0) return;
     tracksLoadedForSceneRef.current = sceneAtStart;
     // Reset sound-history on a full reload so history resets per scene/reopen.
     soundHistory.reset();
@@ -373,7 +401,7 @@ export function InstrumentGeneratorPanel({
     } catch (err) {
       console.error('[InstrumentGeneratorPanel] Failed to load tracks:', err);
     }
-  }, [host, activeSceneId, packStatus, soundHistory]);
+  }, [host, activeSceneId, packStatus, userPackCount, soundHistory]);
 
   useEffect(() => {
     void loadTracks();
@@ -529,10 +557,10 @@ export function InstrumentGeneratorPanel({
   // track (which would generate nothing useful without contract context).
   useEffect(() => {
     if (!onHeaderContent) return;
-    // Phase 1.1: hide "+ Add" until the sample pack is installed — the
-    // panel body shows a CTA card in that state and adding tracks would
-    // produce silent ones.
-    if (packStatus !== 'current') {
+    // Hide "+ Add" until SOME library is installed — the stock pack OR ≥1 user
+    // pack. In the no-library state the body shows a CTA card and adding tracks
+    // would produce silent ones.
+    if (packStatus !== 'current' && userPackCount === 0) {
       onHeaderContent(null);
       return () => { onHeaderContent(null); };
     }
@@ -546,6 +574,19 @@ export function InstrumentGeneratorPanel({
 
     onHeaderContent(
       <div className="flex gap-1">
+        {host.openSampleImportWizard && (
+          <button
+            data-testid="import-own-samples-instruments-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              host.openSampleImportWizard?.('instruments');
+            }}
+            title="Import your own instrument samples from a folder"
+            className="px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent"
+          >
+            Import Samples
+          </button>
+        )}
         {host.listImportableTracks && (
           <button
             data-testid="import-from-scene-instruments-button"
@@ -590,7 +631,7 @@ export function InstrumentGeneratorPanel({
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
-      needsContract, activeSceneId, tracks.length, availableCategories.length,
+      userPackCount, needsContract, activeSceneId, tracks.length, availableCategories.length,
       handleAddTrack, onOpenContract, host]);
 
   // --- Per-track state updates ---
@@ -1037,14 +1078,28 @@ export function InstrumentGeneratorPanel({
     );
   }
 
-  if (packStatus !== 'current') {
+  // No stock pack AND no user packs → CTA card, plus a path to import your own.
+  if (packStatus !== 'current' && userPackCount === 0) {
     return (
-      <SamplePackCTACard
-        host={host}
-        pack={packInfo}
-        status={packStatus}
-        onDownloadComplete={refreshPackStatus}
-      />
+      <div className="space-y-2">
+        <SamplePackCTACard
+          host={host}
+          pack={packInfo}
+          status={packStatus}
+          onDownloadComplete={refreshPackStatus}
+        />
+        {host.openSampleImportWizard && (
+          <div className="text-center">
+            <button
+              data-testid="import-own-samples-cta-instruments"
+              onClick={() => host.openSampleImportWizard?.('instruments')}
+              className="text-sas-muted text-xs hover:text-sas-accent transition-colors underline underline-offset-2"
+            >
+              …or import your own instrument samples
+            </button>
+          </div>
+        )}
+      </div>
     );
   }
 
