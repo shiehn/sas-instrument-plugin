@@ -35,7 +35,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -116,6 +116,14 @@ export function InstrumentGeneratorPanel({
   onExpandSelf,
   sceneContext,
 }: PluginUIProps): React.ReactElement {
+  // Cosmetic per-track peak meters. Poll while the panel is mounted + visible;
+  // NOT gated on transport state (this app plays via decks/clip-launcher, so the
+  // linear "is playing" flag is unreliable). Stopped tracks just read the floor.
+  // The host coalesces the read so playback always wins over the GUI. Older
+  // hosts (no getTrackLevels) degrade to no meter via the `supportsMeters` guard.
+  const supportsMeters = typeof host.getTrackLevels === 'function';
+  const trackLevels = useTrackLevels(host);
+
   const [tracks, setTracks] = useState<InstrumentTrackState[]>([]);
   const [library, setLibrary] = useState<InstrumentLibrary | null>(null);
   const [libraryError, setLibraryError] = useState<string | null>(null);
@@ -1136,6 +1144,7 @@ export function InstrumentGeneratorPanel({
           key={track.handle.id}
           drag={reorder.dragPropsFor(index)}
           track={{ id: track.handle.id, name: track.handle.name, role: track.category }}
+          levels={supportsMeters ? trackLevels : undefined}
           prompt={track.prompt}
           runtimeState={{
             muted: track.muted,
