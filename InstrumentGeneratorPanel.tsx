@@ -35,7 +35,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -106,6 +106,14 @@ interface InstrumentTrackState {
   drawerTab: DrawerTab;
 }
 
+// Crossfade tracks (transition scenes): shared metadata + parsing live in the
+// SDK (crossfade-meta.ts); only the live-track-bound resolved pair is panel-local.
+/** A crossfade pair resolved against live track state (both members present). */
+interface ResolvedCrossfadePair extends CrossfadePairMeta {
+  origin: InstrumentTrackState;
+  target: InstrumentTrackState;
+}
+
 export function InstrumentGeneratorPanel({
   host,
   activeSceneId,
@@ -130,6 +138,11 @@ export function InstrumentGeneratorPanel({
   const [isAddingTrack, setIsAddingTrack] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [soundImportTarget, setSoundImportTarget] = useState<InstrumentTrackState | null>(null);
+  // Crossfade tracks (transition scenes): the "+ Crossfade" modal + parsed pair
+  // metadata for the active scene (members are normal tracks linked via scene-data).
+  const [crossfadeOpen, setCrossfadeOpen] = useState(false);
+  const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
+  const [isCreatingCrossfade, setIsCreatingCrossfade] = useState(false);
   const isAddingTrackRef = useRef(false);
   // Stable engine-id → DB-id map (rebuilt on load + kept in sync with tracks).
   // Scene data is keyed by the DB id, which is stable across reloads.
@@ -310,6 +323,7 @@ export function InstrumentGeneratorPanel({
     const sceneAtStart = activeSceneId;
     if (!sceneAtStart) {
       setTracks([]);
+      setCrossfadePairsMeta([]);
       tracksLoadedForSceneRef.current = null;
       return;
     }
@@ -424,6 +438,11 @@ export function InstrumentGeneratorPanel({
           soundHistory.restore(ts.handle.id, persisted as TrackSoundHistory);
         }
       }
+      // Group crossfade members (normal tracks linked by a shared groupId in
+      // scene-data) into pairs; the render layer excludes their standalone rows.
+      if (tracksLoadedForSceneRef.current === sceneAtStart) {
+        setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
+      }
     } catch (err) {
       console.error('[InstrumentGeneratorPanel] Failed to load tracks:', err);
     }
@@ -464,6 +483,10 @@ export function InstrumentGeneratorPanel({
   );
 
   const needsContract = !sceneContext?.hasContract;
+  const xfFromId = sceneContext?.transitionFromSceneId ?? null;
+  const xfToId = sceneContext?.transitionToSceneId ?? null;
+  const canCrossfade =
+    sceneContext?.sceneType === 'transition' && !!xfFromId && !!xfToId && !!host.listSceneFamilyTracks;
 
   // --- Add Track ---
   // Declared above the header useEffect because the effect depends on this
@@ -577,6 +600,116 @@ export function InstrumentGeneratorPanel({
     [host, activeSceneId, isConnected, tracks.length, availableCategories, library, applyInstrumentSound, soundHistory, loadTracks],
   );
 
+  // --- Create a crossfade pair (transition scenes) ----------------------
+  // Two instrument tracks share ONE generated pitched clip; the top wears the
+  // ORIGIN sampler, the bottom the TARGET's. One-action: generate → create both
+  // → write same MIDI → copy samplers → equal-power volumes → persist. LIFO
+  // rollback. Throws on failure so the modal surfaces it.
+  const handleCreateCrossfade = useCallback(
+    async (origin: CrossfadeSelection, target: CrossfadeSelection): Promise<void> => {
+      const scene = activeSceneId;
+      const fromSceneId = sceneContext?.transitionFromSceneId ?? '';
+      const toSceneId = sceneContext?.transitionToSceneId ?? '';
+      if (!scene) throw new Error('No active scene.');
+      if (!isConnected) throw new Error('Systems not connected.');
+      if (!isAuthenticated) throw new Error('Please sign in to generate the bridge.');
+      if (!library || availableCategories.length === 0) throw new Error('Instrument library is empty.');
+      if (tracks.length + 2 > MAX_TRACKS) throw new Error('Not enough track slots for a crossfade.');
+
+      setIsCreatingCrossfade(true);
+      const created: PluginTrackHandle[] = [];
+      try {
+        const role = origin.role ?? target.role ?? '';
+
+        // 1. Generate ONE pitched bridge clip (before creating the empty tracks).
+        const mc = await host.getMusicalContext();
+        const genCtx = await host.getGenerationContext();
+        const concurrentBlock = formatConcurrentTracks(genCtx);
+        const userPrompt = [
+          concurrentBlock || undefined,
+          concurrentBlock ? '' : undefined,
+          `This is a TRANSITION bridge. Generate a pitched MIDI clip over the transition's chord progression that carries "${origin.name}" into "${target.name}".`,
+        ]
+          .filter((l): l is string => l !== undefined)
+          .join('\n');
+        const llm = await host.generateWithLLM({
+          system: buildInstrumentSystemPrompt(availableCategories),
+          user: userPrompt,
+          responseFormat: 'json',
+        });
+        const parsed = parseLLMInstrumentResponse(llm.content);
+        if (!parsed || parsed.notes.length === 0) {
+          throw new Error('The bridge generator returned no notes.');
+        }
+        // Pitched — no flatten, no removeOverlaps (polyphonic sampler).
+        const notes = await host.postProcessMidi(parsed.notes, { quantize: false, removeOverlaps: false });
+        const clip: MidiClipData = {
+          startTime: 0,
+          endTime: (mc.bars * 4 * 60) / mc.bpm,
+          tempo: mc.bpm,
+          notes,
+        };
+
+        // 2. Create the two layer tracks (sampler loaded from the source below).
+        const top = await host.createTrack({ name: `instrument-${Date.now()}-xf-o` });
+        created.push(top);
+        const bottom = await host.createTrack({ name: `instrument-${Date.now()}-xf-t` });
+        created.push(bottom);
+        if (role) {
+          await host.setTrackRole(top.id, role).catch(() => {});
+          await host.setTrackRole(bottom.id, role).catch(() => {});
+        }
+
+        // 3. SAME MIDI on both layers.
+        await host.writeMidiClip(top.id, clip);
+        await host.writeMidiClip(bottom.id, clip);
+
+        // 4. Copy each source sampler (zones) onto its layer (exact sound).
+        const copyInstrumentSound = async (newTrackId: string, sourceDbId: string): Promise<string> => {
+          if (!host.getTrackSound) return 'default';
+          const snap = await host.getTrackSound(sourceDbId);
+          if (!snap || snap.kind !== 'instrument') return 'default';
+          await applyInstrumentSound(newTrackId, {
+            displayName: snap.displayName,
+            instrumentId: snap.instrumentId,
+            zones: snap.zones,
+          });
+          return snap.label;
+        };
+        const originLabel = await copyInstrumentSound(top.id, origin.dbId);
+        const targetLabel = await copyInstrumentSound(bottom.id, target.dbId);
+
+        // 5. Equal-power center.
+        await host.setTrackVolume(top.id, EQUAL_POWER_GAIN).catch(() => {});
+        await host.setTrackVolume(bottom.id, EQUAL_POWER_GAIN).catch(() => {});
+
+        // 6. Persist the pairing.
+        const groupId = top.dbId;
+        const originMeta: CrossfadeMeta = {
+          groupId, slot: 'origin', partnerDbId: bottom.dbId, sourceTrackDbId: origin.dbId,
+          sourceSceneId: fromSceneId, sourceName: origin.name, soundLabel: originLabel, sliderPos: 0.5,
+        };
+        const targetMeta: CrossfadeMeta = {
+          groupId, slot: 'target', partnerDbId: top.dbId, sourceTrackDbId: target.dbId,
+          sourceSceneId: toSceneId, sourceName: target.name, soundLabel: targetLabel, sliderPos: 0.5,
+        };
+        await host.setSceneData(scene, `track:${top.dbId}:crossfade`, originMeta);
+        await host.setSceneData(scene, `track:${bottom.dbId}:crossfade`, targetMeta);
+
+        await loadTracks();
+        host.showToast('success', 'Crossfade created', `${origin.name} → ${target.name}`);
+      } catch (err: unknown) {
+        for (const h of [...created].reverse()) {
+          try { await host.deleteTrack(h.id); } catch { /* best effort */ }
+        }
+        throw err instanceof Error ? err : new Error(String(err));
+      } finally {
+        setIsCreatingCrossfade(false);
+      }
+    },
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableCategories, library, applyInstrumentSound, loadTracks],
+  );
+
   // --- Header content: "+ Add" button rendered up in the accordion strip.
   // Mirrors drum-generator's pattern. When no contract exists the button
   // bounces the user to the Contract section instead of trying to add a
@@ -653,12 +786,32 @@ export function InstrumentGeneratorPanel({
         >
           Add Track
         </button>
+        {canCrossfade && (
+          <button
+            data-testid="add-crossfade-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (needsContract) { onOpenContract?.(); return; }
+              onExpandSelf?.();
+              setCrossfadeOpen(true);
+            }}
+            disabled={!activeSceneId || needsContract || isCreatingCrossfade || tracks.length + 2 > MAX_TRACKS}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              !activeSceneId || needsContract || isCreatingCrossfade || tracks.length + 2 > MAX_TRACKS
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+            title="Crossfade an origin track into a target track over this transition"
+          >
+            + Crossfade
+          </button>
+        )}
       </div>
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       userPackCount, needsContract, activeSceneId, tracks.length, availableCategories.length,
-      handleAddTrack, onOpenContract, host]);
+      handleAddTrack, onOpenContract, host, canCrossfade, isCreatingCrossfade, onExpandSelf]);
 
   // --- Per-track state updates ---
   const updateTrack = useCallback((trackId: string, patch: Partial<InstrumentTrackState>) => {
@@ -690,6 +843,40 @@ export function InstrumentGeneratorPanel({
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
       host.showToast('error', 'Failed to delete track', msg);
+    }
+  }, [host, activeSceneId]);
+
+  // --- Crossfade group controls -----------------------------------------
+  // Mute/solo act on BOTH layers together (this panel keeps muted/solo as flat
+  // track fields); per-layer volume/pan reuse the normal handlers. Delete removes
+  // the whole pair + its scene-data key.
+  const handleCrossfadeMute = useCallback((pair: ResolvedCrossfadePair): void => {
+    const newMuted = !pair.origin.muted;
+    for (const id of [pair.origin.handle.id, pair.target.handle.id]) {
+      setTracks(prev => prev.map(t => (t.handle.id === id ? { ...t, muted: newMuted } : t)));
+      host.setTrackMute(id, newMuted).catch(() => {});
+    }
+  }, [host]);
+
+  const handleCrossfadeSolo = useCallback((pair: ResolvedCrossfadePair): void => {
+    const newSolo = !pair.origin.solo;
+    for (const id of [pair.origin.handle.id, pair.target.handle.id]) {
+      setTracks(prev => prev.map(t => (t.handle.id === id ? { ...t, solo: newSolo } : t)));
+      host.setTrackSolo(id, newSolo).catch(() => {});
+    }
+  }, [host]);
+
+  const handleCrossfadeDelete = useCallback(async (pair: ResolvedCrossfadePair): Promise<void> => {
+    try {
+      for (const member of [pair.origin, pair.target]) {
+        await host.deleteTrack(member.handle.id);
+        if (activeSceneId) await host.deleteSceneData(activeSceneId, `track:${member.handle.dbId}:crossfade`);
+      }
+      setCrossfadePairsMeta(prev => prev.filter(p => p.groupId !== pair.groupId));
+      setTracks(prev => prev.filter(t => t.handle.id !== pair.origin.handle.id && t.handle.id !== pair.target.handle.id));
+      host.showToast('success', 'Crossfade removed');
+    } catch (err: unknown) {
+      host.showToast('error', 'Failed to delete crossfade', err instanceof Error ? err.message : String(err));
     }
   }, [host, activeSceneId]);
 
@@ -1086,6 +1273,25 @@ export function InstrumentGeneratorPanel({
     }
   }, [host, tracks, isAuthenticated, library, availableCategories, updateTrack, activeSceneId, soundHistory]);
 
+  // Resolve crossfade pairs against live track state. Only COMPLETE pairs (both
+  // members present in `tracks`) group into a CrossfadeTrackRow; a half-broken
+  // pair's surviving member falls back to a normal row (not excluded).
+  const { resolvedCrossfadePairs, crossfadeMemberDbIds } = useMemo(() => {
+    const byDbId = new Map(tracks.map((t) => [t.handle.dbId, t]));
+    const pairs: ResolvedCrossfadePair[] = [];
+    const members = new Set<string>();
+    for (const p of crossfadePairsMeta) {
+      const origin = byDbId.get(p.originDbId);
+      const target = byDbId.get(p.targetDbId);
+      if (origin && target) {
+        pairs.push({ ...p, origin, target });
+        members.add(p.originDbId);
+        members.add(p.targetDbId);
+      }
+    }
+    return { resolvedCrossfadePairs: pairs, crossfadeMemberDbIds: members };
+  }, [tracks, crossfadePairsMeta]);
+
   // --- Render ---
 
   // Scene needs a contract before track generation makes sense — the LLM
@@ -1157,7 +1363,51 @@ export function InstrumentGeneratorPanel({
         <div className="text-xs text-red-400 px-2 py-1">{libraryError}</div>
       )}
 
-      {tracks.map((track, index) => (
+      {canCrossfade && xfFromId && xfToId && (
+        <CrossfadeModal
+          host={host}
+          open={crossfadeOpen}
+          fromSceneId={xfFromId}
+          toSceneId={xfToId}
+          onClose={() => setCrossfadeOpen(false)}
+          onCreate={handleCreateCrossfade}
+          testIdPrefix="instruments-crossfade"
+        />
+      )}
+
+      {resolvedCrossfadePairs.map((pair) => (
+        <CrossfadeTrackRow
+          key={pair.groupId}
+          accentColor="#9333EA"
+          levels={supportsMeters ? trackLevels : undefined}
+          sliderPos={pair.sliderPos}
+          origin={{
+            trackId: pair.origin.handle.id,
+            name: pair.origin.handle.name,
+            role: pair.origin.category,
+            sourceName: pair.originSourceName,
+            soundLabel: pair.originSoundLabel,
+            runtimeState: { muted: pair.origin.muted, solo: pair.origin.solo, volume: pair.origin.volume, pan: pair.origin.pan },
+          }}
+          target={{
+            trackId: pair.target.handle.id,
+            name: pair.target.handle.name,
+            role: pair.target.category,
+            sourceName: pair.targetSourceName,
+            soundLabel: pair.targetSoundLabel,
+            runtimeState: { muted: pair.target.muted, solo: pair.target.solo, volume: pair.target.volume, pan: pair.target.pan },
+          }}
+          onMuteToggle={() => handleCrossfadeMute(pair)}
+          onSoloToggle={() => handleCrossfadeSolo(pair)}
+          onVolumeChange={(slot: CrossfadeSlot, vol: number) => { void handleVolumeChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, vol); }}
+          onPanChange={(slot: CrossfadeSlot, pan: number) => { void handlePanChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, pan); }}
+          onDelete={() => handleCrossfadeDelete(pair)}
+        />
+      ))}
+
+      {tracks.map((track, index) => {
+        if (crossfadeMemberDbIds.has(track.handle.dbId)) return null;
+        return (
         <TrackRow
           key={track.handle.id}
           drag={reorder.dragPropsFor(index)}
@@ -1212,7 +1462,8 @@ export function InstrumentGeneratorPanel({
           editSnap={0.25}
           onAuditionNote={(pitch, vel, ms) => { void host.auditionNote(track.handle.id, pitch, vel, ms); }}
         />
-      ))}
+        );
+      })}
     </div>
   );
 }
