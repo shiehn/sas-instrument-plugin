@@ -35,7 +35,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, buildCrossfadeInpaintPrompt, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -600,6 +600,23 @@ export function InstrumentGeneratorPanel({
     [host, activeSceneId, isConnected, tracks.length, availableCategories, library, applyInstrumentSound, soundHistory, loadTracks],
   );
 
+  // Apply the crossfade volume automation: origin fades out, target fades in
+  // across the loop (equal-power, crossover at sliderPos). Falls back to a static
+  // equal-power blend on hosts without setTrackVolumeAutomation.
+  const applyCrossfadeAutomation = useCallback(
+    async (originTrackId: string, targetTrackId: string, bars: number, bpm: number, sliderPos: number): Promise<void> => {
+      if (host.setTrackVolumeAutomation) {
+        const curves = buildCrossfadeVolumeCurves(bars, bpm, sliderPos);
+        await host.setTrackVolumeAutomation(originTrackId, curves.origin).catch(() => {});
+        await host.setTrackVolumeAutomation(targetTrackId, curves.target).catch(() => {});
+      } else {
+        await host.setTrackVolume(originTrackId, EQUAL_POWER_GAIN).catch(() => {});
+        await host.setTrackVolume(targetTrackId, EQUAL_POWER_GAIN).catch(() => {});
+      }
+    },
+    [host],
+  );
+
   // --- Create a crossfade pair (transition scenes) ----------------------
   // Two instrument tracks share ONE generated pitched clip; the top wears the
   // ORIGIN sampler, the bottom the TARGET's. One-action: generate → create both
@@ -690,9 +707,9 @@ export function InstrumentGeneratorPanel({
         const originLabel = await copyInstrumentSound(top.id, origin.dbId);
         const targetLabel = await copyInstrumentSound(bottom.id, target.dbId);
 
-        // 5. Equal-power center.
-        await host.setTrackVolume(top.id, EQUAL_POWER_GAIN).catch(() => {});
-        await host.setTrackVolume(bottom.id, EQUAL_POWER_GAIN).catch(() => {});
+        // 5. Crossfade volume automation (origin fades out, target fades in
+        // across the loop; equal-power, crossover at the centered slider).
+        await applyCrossfadeAutomation(top.id, bottom.id, mc.bars, mc.bpm, 0.5);
 
         // 6. Persist the pairing.
         const groupId = top.dbId;
@@ -718,7 +735,7 @@ export function InstrumentGeneratorPanel({
         setIsCreatingCrossfade(false);
       }
     },
-    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableCategories, library, applyInstrumentSound, loadTracks],
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableCategories, library, applyInstrumentSound, applyCrossfadeAutomation, loadTracks],
   );
 
   // --- Header content: "+ Add" button rendered up in the accordion strip.
@@ -890,6 +907,27 @@ export function InstrumentGeneratorPanel({
       host.showToast('error', 'Failed to delete crossfade', err instanceof Error ? err.message : String(err));
     }
   }, [host, activeSceneId]);
+
+  // Drag the crossfade fader: optimistic UI now, debounced engine apply + persist
+  // of sliderPos (recomputes the equal-power curves at the new crossover point).
+  const crossfadeSliderTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const handleCrossfadeSlider = useCallback((pair: ResolvedCrossfadePair, pos: number): void => {
+    setCrossfadePairsMeta(prev => prev.map(p => (p.groupId === pair.groupId ? { ...p, sliderPos: pos } : p)));
+    if (crossfadeSliderTimers.current[pair.groupId]) clearTimeout(crossfadeSliderTimers.current[pair.groupId]);
+    crossfadeSliderTimers.current[pair.groupId] = setTimeout(() => {
+      void (async () => {
+        const mc = await host.getMusicalContext();
+        await applyCrossfadeAutomation(pair.origin.handle.id, pair.target.handle.id, mc.bars, mc.bpm, pos);
+        if (activeSceneId) {
+          const sceneData = (await host.getAllSceneData(activeSceneId)) as Record<string, unknown>;
+          for (const dbId of [pair.originDbId, pair.targetDbId]) {
+            const meta = asCrossfadeMeta(sceneData[`track:${dbId}:crossfade`]);
+            if (meta) host.setSceneData(activeSceneId, `track:${dbId}:crossfade`, { ...meta, sliderPos: pos }).catch(() => {});
+          }
+        }
+      })();
+    }, 200);
+  }, [host, activeSceneId, applyCrossfadeAutomation]);
 
   const handleMuteToggle = useCallback(async (trackId: string): Promise<void> => {
     const t = tracks.find(t => t.handle.id === trackId);
@@ -1412,6 +1450,7 @@ export function InstrumentGeneratorPanel({
           onSoloToggle={() => handleCrossfadeSolo(pair)}
           onVolumeChange={(slot: CrossfadeSlot, vol: number) => { void handleVolumeChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, vol); }}
           onPanChange={(slot: CrossfadeSlot, pan: number) => { void handlePanChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, pan); }}
+          onSliderChange={(pos: number) => handleCrossfadeSlider(pair, pos)}
           onDelete={() => handleCrossfadeDelete(pair)}
         />
       ))}
