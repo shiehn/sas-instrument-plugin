@@ -35,7 +35,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, buildCrossfadeInpaintPrompt, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -621,17 +621,28 @@ export function InstrumentGeneratorPanel({
       try {
         const role = origin.role ?? target.role ?? '';
 
-        // 1. Generate ONE pitched bridge clip (before creating the empty tracks).
+        // 1. Generate ONE pitched bridge clip via MIDI INPAINTING: morph the
+        // ORIGIN part into the TARGET across the transition. The harmonic frame
+        // (key/bpm/chords) auto-prefixes; we add the two endpoint patterns (a
+        // pitch-named gloss + JSON) — no concurrent sibling layers. Done before
+        // creating the empty tracks.
         const mc = await host.getMusicalContext();
-        const genCtx = await host.getGenerationContext();
-        const concurrentBlock = formatConcurrentTracks(genCtx);
-        const userPrompt = [
-          concurrentBlock || undefined,
-          concurrentBlock ? '' : undefined,
-          `This is a TRANSITION bridge. Generate a pitched MIDI clip over the transition's chord progression that carries "${origin.name}" into "${target.name}".`,
-        ]
-          .filter((l): l is string => l !== undefined)
-          .join('\n');
+        const [originMidi, targetMidi, originKey, targetKey] = await Promise.all([
+          host.readImportableTrackMidi ? host.readImportableTrackMidi(origin.dbId) : Promise.resolve({ clips: [] }),
+          host.readImportableTrackMidi ? host.readImportableTrackMidi(target.dbId) : Promise.resolve({ clips: [] }),
+          host.getSceneKey ? host.getSceneKey(fromSceneId) : Promise.resolve(null),
+          host.getSceneKey ? host.getSceneKey(toSceneId) : Promise.resolve(null),
+        ]);
+        const userPrompt = buildCrossfadeInpaintPrompt({
+          role,
+          bars: mc.bars,
+          originName: origin.name,
+          targetName: target.name,
+          originKey: originKey ? `${originKey.key} ${originKey.mode}` : null,
+          targetKey: targetKey ? `${targetKey.key} ${targetKey.mode}` : null,
+          originNotes: originMidi.clips[0]?.notes ?? [],
+          targetNotes: targetMidi.clips[0]?.notes ?? [],
+        });
         const llm = await host.generateWithLLM({
           system: buildInstrumentSystemPrompt(availableCategories),
           user: userPrompt,
