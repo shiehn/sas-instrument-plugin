@@ -636,7 +636,7 @@ export function InstrumentGeneratorPanel({
       setIsCreatingCrossfade(true);
       const created: PluginTrackHandle[] = [];
       try {
-        const role = origin.role ?? target.role ?? '';
+        const role = target.role ?? origin.role ?? ''; // bridge heads toward the target
 
         // 1. Generate ONE pitched bridge clip via MIDI INPAINTING: morph the
         // ORIGIN part into the TARGET across the transition. The harmonic frame
@@ -1419,6 +1419,7 @@ export function InstrumentGeneratorPanel({
           fromSceneId={xfFromId}
           toSceneId={xfToId}
           onClose={() => setCrossfadeOpen(false)}
+          excludeSourceDbIds={crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId])}
           onCreate={handleCreateCrossfade}
           testIdPrefix="instruments-crossfade"
         />
