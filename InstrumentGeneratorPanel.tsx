@@ -35,7 +35,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, FadeModal, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -114,6 +114,11 @@ interface ResolvedCrossfadePair extends CrossfadePairMeta {
   target: InstrumentTrackState;
 }
 
+/** A fade (transition orphan) resolved against live track state. */
+interface ResolvedFade extends FadeEntry {
+  track: InstrumentTrackState;
+}
+
 export function InstrumentGeneratorPanel({
   host,
   activeSceneId,
@@ -143,6 +148,14 @@ export function InstrumentGeneratorPanel({
   const [crossfadeOpen, setCrossfadeOpen] = useState(false);
   const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
   const [isCreatingCrossfade, setIsCreatingCrossfade] = useState(false);
+  // Fade tracks (transition scenes): a fade is a crossfade with one empty endpoint
+  // — a lone track that fades in (target-only) or out (origin-only).
+  const [fadeOpen, setFadeOpen] = useState(false);
+  const [fadesMeta, setFadesMeta] = useState<FadeEntry[]>([]);
+  const [isCreatingFade, setIsCreatingFade] = useState(false);
+  // Engine track ids whose fade volume curve was applied this session (keyed by
+  // engine id so reopen → new ids re-applies; curve isn't engine-persisted).
+  const appliedFadeAutomationRef = useRef<Set<string>>(new Set());
   const isAddingTrackRef = useRef(false);
   // Stable engine-id → DB-id map (rebuilt on load + kept in sync with tracks).
   // Scene data is keyed by the DB id, which is stable across reloads.
@@ -324,6 +337,7 @@ export function InstrumentGeneratorPanel({
     if (!sceneAtStart) {
       setTracks([]);
       setCrossfadePairsMeta([]);
+      setFadesMeta([]);
       tracksLoadedForSceneRef.current = null;
       return;
     }
@@ -442,6 +456,7 @@ export function InstrumentGeneratorPanel({
       // scene-data) into pairs; the render layer excludes their standalone rows.
       if (tracksLoadedForSceneRef.current === sceneAtStart) {
         setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
+        setFadesMeta(parseFades(sceneData));
       }
     } catch (err) {
       console.error('[InstrumentGeneratorPanel] Failed to load tracks:', err);
@@ -617,6 +632,24 @@ export function InstrumentGeneratorPanel({
     [host],
   );
 
+  // Apply a fade's one-sided volume curve (volume gesture ramps; build stays flat
+  // at unity so the notes carry the fade). No-op on hosts without automation.
+  const applyFadeAutomation = useCallback(
+    async (
+      trackId: string,
+      direction: FadeDirection,
+      bars: number,
+      bpm: number,
+      sliderPos: number,
+      gesture: FadeGesture,
+    ): Promise<void> => {
+      if (!host.setTrackVolumeAutomation) return;
+      const points = buildFadeVolumeCurve(bars, bpm, direction, sliderPos, gesture);
+      await host.setTrackVolumeAutomation(trackId, points).catch(() => {});
+    },
+    [host],
+  );
+
   // --- Create a crossfade pair (transition scenes) ----------------------
   // Two instrument tracks share ONE generated pitched clip; the top wears the
   // ORIGIN sampler, the bottom the TARGET's. One-action: generate → create both
@@ -738,6 +771,111 @@ export function InstrumentGeneratorPanel({
     [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableCategories, library, applyInstrumentSound, applyCrossfadeAutomation, loadTracks],
   );
 
+  // --- Create a fade (transition orphan) --------------------------------
+  // A fade is a crossfade with one empty endpoint: ONE generated instrument track
+  // that fades in (target-only) or out (origin-only). The pitched part is
+  // inpainted with the source on the populated endpoint and ∅ on the other; the
+  // sampler is copied from the source; the gesture sets the volume-curve depth.
+  const handleCreateFade = useCallback(
+    async (selection: FadeSelection, direction: FadeDirection, gesture: FadeGesture): Promise<void> => {
+      const scene = activeSceneId;
+      const fromSceneId = sceneContext?.transitionFromSceneId ?? '';
+      const toSceneId = sceneContext?.transitionToSceneId ?? '';
+      if (!scene) throw new Error('No active scene.');
+      if (!isConnected) throw new Error('Systems not connected.');
+      if (!isAuthenticated) throw new Error('Please sign in to generate the fade.');
+      if (!library || availableCategories.length === 0) throw new Error('Instrument library is empty.');
+      if (tracks.length + 1 > MAX_TRACKS) throw new Error('Not enough track slots for a fade.');
+
+      setIsCreatingFade(true);
+      const created: PluginTrackHandle[] = [];
+      try {
+        const role = selection.role ?? '';
+        const sourceSceneId = direction === 'out' ? fromSceneId : toSceneId;
+
+        // 1. Inpaint with ONE empty endpoint (grow in / dissolve out), pitched.
+        const mc = await host.getMusicalContext();
+        const [srcMidi, srcKey] = await Promise.all([
+          host.readImportableTrackMidi ? host.readImportableTrackMidi(selection.dbId) : Promise.resolve({ clips: [] }),
+          host.getSceneKey ? host.getSceneKey(sourceSceneId) : Promise.resolve(null),
+        ]);
+        const srcNotes = srcMidi.clips[0]?.notes ?? [];
+        const keyStr = srcKey ? `${srcKey.key} ${srcKey.mode}` : null;
+        const userPrompt = buildCrossfadeInpaintPrompt({
+          role,
+          bars: mc.bars,
+          originName: direction === 'out' ? selection.name : 'silence',
+          targetName: direction === 'in' ? selection.name : 'silence',
+          originKey: direction === 'out' ? keyStr : null,
+          targetKey: direction === 'in' ? keyStr : null,
+          originNotes: direction === 'out' ? srcNotes : [],
+          targetNotes: direction === 'in' ? srcNotes : [],
+        });
+        const llm = await host.generateWithLLM({
+          system: buildInstrumentSystemPrompt(availableCategories),
+          user: userPrompt,
+          responseFormat: 'json',
+        });
+        const parsed = parseLLMInstrumentResponse(llm.content);
+        if (!parsed || parsed.notes.length === 0) {
+          throw new Error('The fade generator returned no notes.');
+        }
+        // Pitched — no flatten, no removeOverlaps (polyphonic sampler).
+        const notes = await host.postProcessMidi(parsed.notes, { quantize: false, removeOverlaps: false });
+        const clip: MidiClipData = { startTime: 0, endTime: (mc.bars * 4 * 60) / mc.bpm, tempo: mc.bpm, notes };
+
+        // 2. Create ONE track (sampler loaded from the source below).
+        const track = await host.createTrack({ name: `instrument-${Date.now()}-fade-${direction}` });
+        created.push(track);
+        if (role) await host.setTrackRole(track.id, role).catch(() => {});
+
+        // 3. MIDI.
+        await host.writeMidiClip(track.id, clip);
+
+        // 4. Copy the source sampler (zones).
+        let soundLabel = 'default';
+        if (host.getTrackSound) {
+          const snap = await host.getTrackSound(selection.dbId);
+          if (snap && snap.kind === 'instrument') {
+            await applyInstrumentSound(track.id, {
+              displayName: snap.displayName,
+              instrumentId: snap.instrumentId,
+              zones: snap.zones,
+            });
+            soundLabel = snap.label;
+          }
+        }
+
+        // 5. One-sided volume curve (centered slider).
+        await applyFadeAutomation(track.id, direction, mc.bars, mc.bpm, 0.5, gesture);
+        appliedFadeAutomationRef.current.add(track.id);
+
+        // 6. Persist the fade metadata.
+        const meta: FadeMeta = {
+          direction,
+          gesture,
+          sourceTrackDbId: selection.dbId,
+          sourceSceneId,
+          sourceName: selection.name,
+          soundLabel,
+          sliderPos: 0.5,
+        };
+        await host.setSceneData(scene, `track:${track.dbId}:fade`, meta);
+
+        await loadTracks();
+        host.showToast('success', direction === 'in' ? 'Fade in created' : 'Fade out created', selection.name);
+      } catch (err: unknown) {
+        for (const h of [...created].reverse()) {
+          try { await host.deleteTrack(h.id); } catch { /* best effort */ }
+        }
+        throw err instanceof Error ? err : new Error(String(err));
+      } finally {
+        setIsCreatingFade(false);
+      }
+    },
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableCategories, library, applyInstrumentSound, applyFadeAutomation, loadTracks],
+  );
+
   // --- Header content: "+ Add" button rendered up in the accordion strip.
   // Mirrors drum-generator's pattern. When no contract exists the button
   // bounces the user to the Contract section instead of trying to add a
@@ -834,12 +972,32 @@ export function InstrumentGeneratorPanel({
             + Crossfade
           </button>
         )}
+        {canCrossfade && (
+          <button
+            data-testid="add-fade-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (needsContract) { onOpenContract?.(); return; }
+              onExpandSelf?.();
+              setFadeOpen(true);
+            }}
+            disabled={!activeSceneId || needsContract || isCreatingFade || tracks.length + 1 > MAX_TRACKS}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              !activeSceneId || needsContract || isCreatingFade || tracks.length + 1 > MAX_TRACKS
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+            title="Fade an orphan track in or out across this transition"
+          >
+            + Fade
+          </button>
+        )}
       </div>
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       userPackCount, needsContract, activeSceneId, tracks.length, availableCategories.length,
-      handleAddTrack, onOpenContract, host, canCrossfade, isCreatingCrossfade, onExpandSelf]);
+      handleAddTrack, onOpenContract, host, canCrossfade, isCreatingCrossfade, isCreatingFade, onExpandSelf]);
 
   // --- Per-track state updates ---
   const updateTrack = useCallback((trackId: string, patch: Partial<InstrumentTrackState>) => {
@@ -928,6 +1086,38 @@ export function InstrumentGeneratorPanel({
       })();
     }, 200);
   }, [host, activeSceneId, applyCrossfadeAutomation]);
+
+  // --- Fade controls ----------------------------------------------------
+  // A fade is a single normal track, so mute/solo/volume/pan reuse the normal
+  // per-track handlers. Only delete + the fade slider are fade-specific.
+  const handleFadeDelete = useCallback(async (fade: ResolvedFade): Promise<void> => {
+    try {
+      await host.deleteTrack(fade.track.handle.id);
+      if (activeSceneId) await host.deleteSceneData(activeSceneId, `track:${fade.dbId}:fade`);
+      setFadesMeta(prev => prev.filter(f => f.dbId !== fade.dbId));
+      setTracks(prev => prev.filter(t => t.handle.id !== fade.track.handle.id));
+      host.showToast('success', 'Fade removed');
+    } catch (err: unknown) {
+      host.showToast('error', 'Failed to delete fade', err instanceof Error ? err.message : String(err));
+    }
+  }, [host, activeSceneId]);
+
+  const fadeSliderTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const handleFadeSlider = useCallback((fade: ResolvedFade, pos: number): void => {
+    setFadesMeta(prev => prev.map(f => (f.dbId === fade.dbId ? { ...f, meta: { ...f.meta, sliderPos: pos } } : f)));
+    if (fadeSliderTimers.current[fade.dbId]) clearTimeout(fadeSliderTimers.current[fade.dbId]);
+    fadeSliderTimers.current[fade.dbId] = setTimeout(() => {
+      void (async () => {
+        const mc = await host.getMusicalContext();
+        await applyFadeAutomation(fade.track.handle.id, fade.meta.direction, mc.bars, mc.bpm, pos, fade.meta.gesture);
+        if (activeSceneId) {
+          const sceneData = (await host.getAllSceneData(activeSceneId)) as Record<string, unknown>;
+          const meta = asFadeMeta(sceneData[`track:${fade.dbId}:fade`]);
+          if (meta) host.setSceneData(activeSceneId, `track:${fade.dbId}:fade`, { ...meta, sliderPos: pos }).catch(() => {});
+        }
+      })();
+    }, 200);
+  }, [host, activeSceneId, applyFadeAutomation]);
 
   const handleMuteToggle = useCallback(async (trackId: string): Promise<void> => {
     const t = tracks.find(t => t.handle.id === trackId);
@@ -1341,6 +1531,35 @@ export function InstrumentGeneratorPanel({
     return { resolvedCrossfadePairs: pairs, crossfadeMemberDbIds: members };
   }, [tracks, crossfadePairsMeta]);
 
+  // Resolve fades against live track state (one FadeTrackRow per fade; member
+  // excluded from the normal list; a fade whose track is gone is dropped).
+  const { resolvedFades, fadeMemberDbIds } = useMemo(() => {
+    const byDbId = new Map(tracks.map((t) => [t.handle.dbId, t]));
+    const list: ResolvedFade[] = [];
+    const members = new Set<string>();
+    for (const f of fadesMeta) {
+      const track = byDbId.get(f.dbId);
+      if (track) { list.push({ ...f, track }); members.add(f.dbId); }
+    }
+    return { resolvedFades: list, fadeMemberDbIds: members };
+  }, [tracks, fadesMeta]);
+
+  // Re-apply each fade's one-sided volume curve on load (not engine-persisted;
+  // recompute from sliderPos + gesture). Keyed by engine id (once per resolve,
+  // incl. after reopen → new ids).
+  useEffect(() => {
+    if (!host.setTrackVolumeAutomation || resolvedFades.length === 0) return;
+    void (async () => {
+      const mc = await host.getMusicalContext();
+      for (const fade of resolvedFades) {
+        const id = fade.track.handle.id;
+        if (appliedFadeAutomationRef.current.has(id)) continue;
+        appliedFadeAutomationRef.current.add(id);
+        await applyFadeAutomation(id, fade.meta.direction, mc.bars, mc.bpm, fade.meta.sliderPos, fade.meta.gesture);
+      }
+    })();
+  }, [resolvedFades, host, applyFadeAutomation]);
+
   // --- Render ---
 
   // Scene needs a contract before track generation makes sense — the LLM
@@ -1419,9 +1638,27 @@ export function InstrumentGeneratorPanel({
           fromSceneId={xfFromId}
           toSceneId={xfToId}
           onClose={() => setCrossfadeOpen(false)}
-          excludeSourceDbIds={crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId])}
+          excludeSourceDbIds={[
+            ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
+            ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
+          ]}
           onCreate={handleCreateCrossfade}
           testIdPrefix="instruments-crossfade"
+        />
+      )}
+      {canCrossfade && xfFromId && xfToId && (
+        <FadeModal
+          host={host}
+          open={fadeOpen}
+          fromSceneId={xfFromId}
+          toSceneId={xfToId}
+          onClose={() => setFadeOpen(false)}
+          excludeSourceDbIds={[
+            ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
+            ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
+          ]}
+          onCreate={handleCreateFade}
+          testIdPrefix="instruments-fade"
         />
       )}
 
@@ -1456,8 +1693,33 @@ export function InstrumentGeneratorPanel({
         />
       ))}
 
+      {resolvedFades.map((fade) => (
+        <FadeTrackRow
+          key={fade.dbId}
+          accentColor="#9333EA"
+          levels={supportsMeters ? trackLevels : undefined}
+          direction={fade.meta.direction}
+          gesture={fade.meta.gesture}
+          sliderPos={fade.meta.sliderPos}
+          layer={{
+            trackId: fade.track.handle.id,
+            name: fade.track.handle.name,
+            role: fade.track.category,
+            sourceName: fade.meta.sourceName,
+            soundLabel: fade.meta.soundLabel,
+            runtimeState: { muted: fade.track.muted, solo: fade.track.solo, volume: fade.track.volume, pan: fade.track.pan },
+          }}
+          onMuteToggle={() => { void handleMuteToggle(fade.track.handle.id); }}
+          onSoloToggle={() => { void handleSoloToggle(fade.track.handle.id); }}
+          onVolumeChange={(vol: number) => { void handleVolumeChange(fade.track.handle.id, vol); }}
+          onPanChange={(pan: number) => { void handlePanChange(fade.track.handle.id, pan); }}
+          onSliderChange={(pos: number) => handleFadeSlider(fade, pos)}
+          onDelete={() => handleFadeDelete(fade)}
+        />
+      ))}
+
       {tracks.map((track, index) => {
-        if (crossfadeMemberDbIds.has(track.handle.dbId)) return null;
+        if (crossfadeMemberDbIds.has(track.handle.dbId) || fadeMemberDbIds.has(track.handle.dbId)) return null;
         return (
         <TrackRow
           key={track.handle.id}
