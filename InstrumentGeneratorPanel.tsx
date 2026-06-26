@@ -146,7 +146,7 @@ export function InstrumentGeneratorPanel({
   // Transition Designer (transition scenes): the single board replacing the
   // per-pair "+ Crossfade"/"+ Fade" modals, plus parsed pair metadata for the
   // active scene (members are normal tracks linked via scene-data).
-  const [designerOpen, setDesignerOpen] = useState(false);
+  const [designerView, setDesignerView] = useState(false);
   const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
   const [isCreatingCrossfade, setIsCreatingCrossfade] = useState(false);
   // A fade is a crossfade with one empty endpoint — a lone track that fades in
@@ -502,6 +502,10 @@ export function InstrumentGeneratorPanel({
   const xfToId = sceneContext?.transitionToSceneId ?? null;
   const canCrossfade =
     sceneContext?.sceneType === 'transition' && !!xfFromId && !!xfToId && !!host.listSceneFamilyTracks;
+  // Leaving a transition scene drops back to the Tracks view (the toggle is hidden).
+  useEffect(() => {
+    if (!canCrossfade) setDesignerView(false);
+  }, [canCrossfade]);
 
   // --- Add Track ---
   // Declared above the header useEffect because the effect depends on this
@@ -898,8 +902,8 @@ export function InstrumentGeneratorPanel({
       || availableCategories.length === 0;
 
     onHeaderContent(
-      <div className="flex gap-1">
-        {host.openSampleImportWizard && (
+      <div className="flex gap-1 items-center">
+        {(!canCrossfade || !designerView) && host.openSampleImportWizard && (
           <button
             data-testid="import-own-samples-instruments-button"
             onClick={(e: React.MouseEvent) => {
@@ -912,7 +916,7 @@ export function InstrumentGeneratorPanel({
             Import Samples
           </button>
         )}
-        {host.listImportableTracks && (
+        {(!canCrossfade || !designerView) && host.listImportableTracks && (
           <button
             data-testid="import-from-scene-instruments-button"
             onClick={(e: React.MouseEvent) => {
@@ -930,54 +934,72 @@ export function InstrumentGeneratorPanel({
             Import Track
           </button>
         )}
-        <button
-          data-testid="add-instrument-track-button"
-          onClick={(e: React.MouseEvent) => {
-            e.stopPropagation();
-            if (needsContract) { onOpenContract?.(); return; }
-            handleAddTrack();
-          }}
-          className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-            addDisabled
-              ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-              : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
-          }`}
-          title={
-            !activeSceneId ? 'Select a scene first'
-              : needsContract ? 'Generate a contract first'
-              : availableCategories.length === 0 ? 'Empty instrument library'
-              : tracks.length >= MAX_TRACKS ? `Track limit (${MAX_TRACKS}) reached`
-              : 'Create a new instrument track'
-          }
-        >
-          Add Track
-        </button>
-        {canCrossfade && (
+        {(!canCrossfade || !designerView) && (
           <button
-            data-testid="open-transition-designer-button"
+            data-testid="add-instrument-track-button"
             onClick={(e: React.MouseEvent) => {
               e.stopPropagation();
               if (needsContract) { onOpenContract?.(); return; }
-              onExpandSelf?.();
-              setDesignerOpen(true);
+              handleAddTrack();
             }}
-            disabled={!activeSceneId || needsContract || isCreatingCrossfade || isCreatingFade}
             className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-              !activeSceneId || needsContract || isCreatingCrossfade || isCreatingFade
+              addDisabled
                 ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+                : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
             }`}
-            title="Arrange crossfades & fades between the two scenes"
+            title={
+              !activeSceneId ? 'Select a scene first'
+                : needsContract ? 'Generate a contract first'
+                : availableCategories.length === 0 ? 'Empty instrument library'
+                : tracks.length >= MAX_TRACKS ? `Track limit (${MAX_TRACKS}) reached`
+                : 'Create a new instrument track'
+            }
           >
-            Transition Designer
+            Add Track
           </button>
+        )}
+        {canCrossfade && (
+          <div
+            className="flex items-center rounded-sm border border-sas-border overflow-hidden"
+            data-testid="instruments-view-toggle"
+          >
+            <button
+              data-testid="instruments-view-tracks"
+              onClick={(e: React.MouseEvent) => { e.stopPropagation(); setDesignerView(false); }}
+              className={`px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                !designerView
+                  ? 'bg-sas-accent text-sas-bg'
+                  : 'bg-sas-panel-alt text-sas-muted hover:text-sas-accent'
+              }`}
+            >
+              Tracks
+            </button>
+            <button
+              data-testid="instruments-view-transition"
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation();
+                if (needsContract) { onOpenContract?.(); return; }
+                onExpandSelf?.();
+                setDesignerView(true);
+              }}
+              disabled={needsContract}
+              className={`px-2 py-0.5 text-[10px] font-medium transition-colors disabled:opacity-50 ${
+                designerView
+                  ? 'bg-sas-accent text-sas-bg'
+                  : 'bg-sas-panel-alt text-sas-muted hover:text-sas-accent'
+              }`}
+              title="Arrange crossfades & fades between the two scenes"
+            >
+              Transition
+            </button>
+          </div>
         )}
       </div>
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, sceneContext, isConnected, isAddingTrack, packStatus,
       userPackCount, needsContract, activeSceneId, tracks.length, availableCategories.length,
-      handleAddTrack, onOpenContract, host, canCrossfade, isCreatingCrossfade, isCreatingFade, onExpandSelf]);
+      handleAddTrack, onOpenContract, host, canCrossfade, designerView, onExpandSelf]);
 
   // --- Per-track state updates ---
   const updateTrack = useCallback((trackId: string, patch: Partial<InstrumentTrackState>) => {
@@ -1611,14 +1633,12 @@ export function InstrumentGeneratorPanel({
         <div className="text-xs text-red-400 px-2 py-1">{libraryError}</div>
       )}
 
-      {canCrossfade && xfFromId && xfToId && (
+      {designerView && canCrossfade && xfFromId && xfToId ? (
         <TransitionDesigner
           host={host}
-          open={designerOpen}
           fromSceneId={xfFromId}
           toSceneId={xfToId}
           transitionSceneId={activeSceneId ?? ''}
-          onClose={() => setDesignerOpen(false)}
           excludeSourceDbIds={[
             ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
             ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
@@ -1628,8 +1648,8 @@ export function InstrumentGeneratorPanel({
           familyLabel="Instruments"
           testIdPrefix="instruments-transition-designer"
         />
-      )}
-
+      ) : (
+        <>
       {resolvedCrossfadePairs.map((pair) => (
         <CrossfadeTrackRow
           key={pair.groupId}
@@ -1745,6 +1765,8 @@ export function InstrumentGeneratorPanel({
         />
         );
       })}
+        </>
+      )}
     </div>
   );
 }
