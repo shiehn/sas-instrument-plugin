@@ -35,7 +35,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -1555,6 +1555,38 @@ export function InstrumentGeneratorPanel({
     }
     return { resolvedFades: list, fadeMemberDbIds: members };
   }, [tracks, fadesMeta]);
+
+  // Auto re-sync drifted source instruments. A crossfade/fade COPIES each
+  // source's zones onto its layer at creation; if the source track's instrument
+  // later changes, re-copy it on the next load (the layer is locked).
+  useEffect(() => {
+    if (!host.getTrackSound || (resolvedCrossfadePairs.length === 0 && resolvedFades.length === 0)) return;
+    let cancelled = false;
+    const reapplyIfDrifted = async (layerTrackId: string, layerDbId: string, sourceDbId: string): Promise<void> => {
+      if (!host.getTrackSound || cancelled) return;
+      const [sourceSnap, layerSnap] = await Promise.all([
+        host.getTrackSound(sourceDbId),
+        host.getTrackSound(layerDbId),
+      ]);
+      if (cancelled || !sourceSnap || sourceSnap.kind !== 'instrument') return;
+      if (soundIdentity(sourceSnap) === soundIdentity(layerSnap)) return;
+      await applyInstrumentSound(layerTrackId, {
+        displayName: sourceSnap.displayName,
+        instrumentId: sourceSnap.instrumentId,
+        zones: sourceSnap.zones,
+      }).catch(() => {});
+    };
+    void (async () => {
+      for (const pair of resolvedCrossfadePairs) {
+        await reapplyIfDrifted(pair.origin.handle.id, pair.origin.handle.dbId, pair.originSourceDbId);
+        await reapplyIfDrifted(pair.target.handle.id, pair.target.handle.dbId, pair.targetSourceDbId);
+      }
+      for (const fade of resolvedFades) {
+        await reapplyIfDrifted(fade.track.handle.id, fade.track.handle.dbId, fade.meta.sourceTrackDbId);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [resolvedCrossfadePairs, resolvedFades, host, applyInstrumentSound]);
 
   // Re-apply each fade's one-sided volume curve on load (not engine-persisted;
   // recompute from sliderPos + gesture). Keyed by engine id (once per resolve,
