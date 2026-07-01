@@ -750,19 +750,24 @@ export function InstrumentGeneratorPanel({
         await host.writeMidiClip(bottom.id, clip);
 
         // 4. Copy each source sampler (zones) onto its layer (exact sound).
-        const copyInstrumentSound = async (newTrackId: string, sourceDbId: string): Promise<string> => {
+        // Record the copy into the layer's sound history: the persisted history
+        // is the layer's only durable identity (getTrackSound reads it), and the
+        // drift re-sync effect compares identities — an unrecorded copy reads as
+        // "no sound" forever and re-copies on every run. Seed the engine→db map
+        // first: the layer was created this instant, so loadTracks hasn't mapped
+        // it yet and persistSoundHistory would otherwise key by engine id.
+        const copyInstrumentSound = async (layer: { id: string; dbId: string }, sourceDbId: string): Promise<string> => {
           if (!host.getTrackSound) return 'default';
           const snap = await host.getTrackSound(sourceDbId);
           if (!snap || snap.kind !== 'instrument') return 'default';
-          await applyInstrumentSound(newTrackId, {
-            displayName: snap.displayName,
-            instrumentId: snap.instrumentId,
-            zones: snap.zones,
-          });
+          const descriptor = { displayName: snap.displayName, instrumentId: snap.instrumentId, zones: snap.zones };
+          await applyInstrumentSound(layer.id, descriptor);
+          engineToDbIdRef.current.set(layer.id, layer.dbId);
+          soundHistory.record(layer.id, descriptor, snap.label);
           return snap.label;
         };
-        const originLabel = await copyInstrumentSound(top.id, origin.dbId);
-        const targetLabel = await copyInstrumentSound(bottom.id, target.dbId);
+        const originLabel = await copyInstrumentSound(top, origin.dbId);
+        const targetLabel = await copyInstrumentSound(bottom, target.dbId);
 
         // 5. Crossfade volume automation (origin fades out, target fades in
         // across the loop; equal-power, crossover at the centered slider).
@@ -792,7 +797,7 @@ export function InstrumentGeneratorPanel({
         setIsCreatingCrossfade(false);
       }
     },
-    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableCategories, library, applyInstrumentSound, applyCrossfadeAutomation, loadTracks],
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableCategories, library, applyInstrumentSound, applyCrossfadeAutomation, loadTracks, soundHistory],
   );
 
   // --- Create a fade (transition orphan) --------------------------------
@@ -856,16 +861,17 @@ export function InstrumentGeneratorPanel({
         // 3. MIDI.
         await host.writeMidiClip(track.id, clip);
 
-        // 4. Copy the source sampler (zones).
+        // 4. Copy the source sampler (zones). Record it as the layer's history
+        // entry — the persisted history is the layer's durable identity, and the
+        // drift re-sync compares identities (unrecorded ⇒ re-copies every run).
         let soundLabel = 'default';
         if (host.getTrackSound) {
           const snap = await host.getTrackSound(selection.dbId);
           if (snap && snap.kind === 'instrument') {
-            await applyInstrumentSound(track.id, {
-              displayName: snap.displayName,
-              instrumentId: snap.instrumentId,
-              zones: snap.zones,
-            });
+            const descriptor = { displayName: snap.displayName, instrumentId: snap.instrumentId, zones: snap.zones };
+            await applyInstrumentSound(track.id, descriptor);
+            engineToDbIdRef.current.set(track.id, track.dbId);
+            soundHistory.record(track.id, descriptor, snap.label);
             soundLabel = snap.label;
           }
         }
@@ -897,7 +903,7 @@ export function InstrumentGeneratorPanel({
         setIsCreatingFade(false);
       }
     },
-    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableCategories, library, applyInstrumentSound, applyFadeAutomation, loadTracks],
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, availableCategories, library, applyInstrumentSound, applyFadeAutomation, loadTracks, soundHistory],
   );
 
   // --- Header content: "+ Add" button rendered up in the accordion strip.
@@ -1562,8 +1568,20 @@ export function InstrumentGeneratorPanel({
   // Auto re-sync drifted source instruments. A crossfade/fade COPIES each
   // source's zones onto its layer at creation; if the source track's instrument
   // later changes, re-copy it on the next load (the layer is locked).
+  // Runs once per layer↔source membership, not per render: the resolved memos
+  // get fresh array identities on EVERY tracks change (volume tick, mute, …),
+  // and applyInstrumentSound itself calls setTracks — keying the effect on the
+  // arrays alone made each re-copy schedule the next one (observed as a
+  // continuous read→copy→render loop while a transition scene was open).
+  const lastResyncKeyRef = useRef('');
   useEffect(() => {
     if (!host.getTrackSound || (resolvedCrossfadePairs.length === 0 && resolvedFades.length === 0)) return;
+    const resyncKey = [
+      ...resolvedCrossfadePairs.map((p) => `${p.origin.handle.dbId}<${p.originSourceDbId}|${p.target.handle.dbId}<${p.targetSourceDbId}`),
+      ...resolvedFades.map((f) => `${f.track.handle.dbId}<${f.meta.sourceTrackDbId}`),
+    ].join(',');
+    if (resyncKey === lastResyncKeyRef.current) return;
+    lastResyncKeyRef.current = resyncKey;
     let cancelled = false;
     const reapplyIfDrifted = async (layerTrackId: string, layerDbId: string, sourceDbId: string): Promise<void> => {
       if (!host.getTrackSound || cancelled) return;
@@ -1573,11 +1591,18 @@ export function InstrumentGeneratorPanel({
       ]);
       if (cancelled || !sourceSnap || sourceSnap.kind !== 'instrument') return;
       if (soundIdentity(sourceSnap) === soundIdentity(layerSnap)) return;
-      await applyInstrumentSound(layerTrackId, {
+      const descriptor = {
         displayName: sourceSnap.displayName,
         instrumentId: sourceSnap.instrumentId,
         zones: sourceSnap.zones,
-      }).catch(() => {});
+      };
+      try {
+        await applyInstrumentSound(layerTrackId, descriptor);
+        // Persist the layer's new identity so the drift check converges —
+        // without this the layer keeps reading as "no sound" and re-copies
+        // on every subsequent pass.
+        soundHistory.record(layerTrackId, descriptor, sourceSnap.label);
+      } catch { /* best effort — retried on next membership change/reopen */ }
     };
     void (async () => {
       for (const pair of resolvedCrossfadePairs) {
@@ -1589,7 +1614,7 @@ export function InstrumentGeneratorPanel({
       }
     })();
     return () => { cancelled = true; };
-  }, [resolvedCrossfadePairs, resolvedFades, host, applyInstrumentSound]);
+  }, [resolvedCrossfadePairs, resolvedFades, host, applyInstrumentSound, soundHistory]);
 
   // Re-apply each fade's one-sided volume curve on load (not engine-persisted;
   // recompute from sliderPos + gesture). Keyed by engine id (once per resolve,
