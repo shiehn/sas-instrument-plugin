@@ -481,6 +481,29 @@ export function InstrumentGeneratorPanel({
     return unsub;
   }, [host, loadTracks]);
 
+  // --- Re-adopt tracks after agent/CLI tool mutations -------------------
+  // The HTTP API path (compose_scene from the chat plugin, sas CLI calls,
+  // MCP tools, transition_add_crossfade/_fade) creates tracks in the DB
+  // directly via ToolRegistry, bypassing host.createTrack — without this
+  // listener the panel never sees them until a manual scene switch.
+  // Debounced 500ms so a burst of tool calls coalesces into one reload.
+  // Mirrors SynthGeneratorPanel / LoopsPanel.
+  useEffect(() => {
+    if (typeof host.onAfterAgentMutation !== 'function') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsub = host.onAfterAgentMutation(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        void loadTracks();
+      }, 500);
+    });
+    return () => {
+      unsub?.();
+      if (timer) clearTimeout(timer);
+    };
+  }, [host, loadTracks]);
+
   // Keep the engine-id → DB-id map current as tracks are added/removed so
   // prompt saves (keyed by DB id) resolve for freshly-added tracks too.
   useEffect(() => {
