@@ -1857,6 +1857,7 @@ export function InstrumentGeneratorPanel({
           onCopy={() => handleCopy(track.handle.id)}
           onShuffle={() => handleShuffle(track.handle.id)}
           onFxToggle={(cat: FxCategory, en: boolean) => handleFxToggle(track.handle.id, cat, en)}
+          externalFxHost={host}
           onFxPresetChange={(cat: FxCategory, idx: number) => handleFxPresetChange(track.handle.id, cat, idx)}
           onFxDryWetChange={(cat: FxCategory, v: number) => handleFxDryWetChange(track.handle.id, cat, v)}
           onToggleFxDrawer={() => toggleFxDrawer(track.handle.id)}
