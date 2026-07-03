@@ -35,7 +35,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -205,6 +205,11 @@ export function InstrumentGeneratorPanel({
   const soundHistory = useSoundHistory(applyInstrumentSound, { onChange: persistSoundHistory });
   // Cross-panel: dim non-soloed rows when ANY track (any panel) is soloed.
   const anySolo = useAnySolo(host);
+  // Panel mix bus (docs/panel-bus.md §11): volume/M/S + FX on this panel's
+  // summed output. Feature-gated — hidden entirely on hosts without the
+  // bus surface.
+  const panelBus = usePanelBus(host, activeSceneId);
+
 
   // Drag-to-reorder rows (shared SDK hook; persists per-scene by stable dbId).
   const reorder = useTrackReorder<InstrumentTrackState>({
@@ -1746,6 +1751,24 @@ export function InstrumentGeneratorPanel({
       )}
       {!(designerView && canCrossfade) && (
         <>
+          {panelBus.supported && panelBus.bus && (
+            <PanelMasterStrip
+              bus={panelBus.bus}
+              availableFx={panelBus.availableFx}
+              fxLoading={panelBus.fxLoading}
+              soloedOut={anySolo && !panelBus.bus.soloed}
+              fxPickerOpen={panelBus.fxPickerOpen}
+              onToggleFxPicker={panelBus.setFxPickerOpen}
+              onRefreshFx={panelBus.refreshFx}
+              onVolumeChange={panelBus.onVolumeChange}
+              onMuteToggle={panelBus.onMuteToggle}
+              onSoloToggle={panelBus.onSoloToggle}
+              onAddFx={panelBus.onAddFx}
+              onRemoveFx={panelBus.onRemoveFx}
+              onToggleFxEnabled={panelBus.onToggleFxEnabled}
+              onShowFxEditor={panelBus.onShowFxEditor}
+            />
+          )}
       {resolvedCrossfadePairs.map((pair) => (
         <CrossfadeTrackRow
           key={pair.groupId}
