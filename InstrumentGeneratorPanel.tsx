@@ -65,6 +65,23 @@ const MAX_TRACKS = 16;
 const ESTIMATED_GENERATION_MS = 15000;
 const INSTRUMENT_ACCENT_COLOR = '#A78BFA';
 
+/**
+ * The history's currently-applied sound (`entries[cursor]`), validated down to
+ * the { displayName, zones } the sampler re-arm needs. Persisted scene-data is
+ * untrusted at this boundary — older shapes or a hand-edited row must degrade
+ * to "no replay", never a throw inside loadTracks.
+ */
+function currentHistoryDescriptor(
+  h: TrackSoundHistory
+): { displayName: string; zones: ResolvedInstrument['zones'] } | null {
+  const entry = h.cursor >= 0 && h.cursor < h.entries.length ? h.entries[h.cursor] : undefined;
+  const d = entry?.descriptor as { displayName?: unknown; zones?: unknown } | undefined;
+  if (!d || typeof d.displayName !== 'string' || !Array.isArray(d.zones) || d.zones.length === 0) {
+    return null;
+  }
+  return { displayName: d.displayName, zones: d.zones as ResolvedInstrument['zones'] };
+}
+
 interface InstrumentTrackState {
   handle: PluginTrackHandle;
   prompt: string;
@@ -461,6 +478,27 @@ export function InstrumentGeneratorPanel({
         const persisted = sceneData[`track:${ts.handle.dbId}:soundHistory`];
         if (persisted && typeof persisted === 'object') {
           soundHistory.restore(ts.handle.id, persisted as TrackSoundHistory);
+          // Re-arm the multi-zone sampler with the history's CURRENT sound on
+          // scene load. The engine restores sampler state from the saved
+          // project, but when the zone files were missing at open time (sample
+          // library not yet installed) the sampler comes up EMPTY and the
+          // track plays silence until the next sound edit — replaying the
+          // persisted descriptor heals it without an app restart.
+          // `restore: true` marks a replay, NOT a sound edit: frozen tracks
+          // stay frozen and nothing is re-persisted. Mirrors
+          // DrumGeneratorPanel's samplePath re-arm on load.
+          const current = currentHistoryDescriptor(persisted as TrackSoundHistory);
+          if (current) {
+            host
+              .setTrackInstrumentSampler(ts.handle.id, {
+                name: current.displayName,
+                zones: current.zones,
+                restore: true,
+              })
+              .catch((err: unknown) => {
+                console.warn('[InstrumentGeneratorPanel] Failed to re-arm sampler on load:', err);
+              });
+          }
         }
       }
       // Group crossfade members (normal tracks linked by a shared groupId in
