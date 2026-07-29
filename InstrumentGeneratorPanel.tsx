@@ -35,7 +35,7 @@ import type {
   PluginTrackFxDetailState,
   PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection, panelClipEndSeconds, panelQuarterNotesPerBar, panelMeter } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -105,10 +105,13 @@ interface InstrumentTrackState {
   // Piano-roll edit state. `editNotes` is the live, editable copy of the
   // track's MIDI (loaded lazily when the Edit tab is first opened, or seeded
   // from a fresh generation). `editBars`/`editBpm` size the grid + the save
-  // span. See loadEditNotes / handleNotesChange.
+  // span; `editBeatsPerBar` is the scene meter's QUARTER notes per bar
+  // (4 in 4/4; panelQuarterNotesPerBar). See loadEditNotes /
+  // handleNotesChange.
   editNotes: PluginMidiNote[];
   editBars: number;
   editBpm: number;
+  editBeatsPerBar: number;
   // Volume/pan/mute/solo — local state only, kept in sync with host.
   muted: boolean;
   solo: boolean;
@@ -442,6 +445,7 @@ export function InstrumentGeneratorPanel({
           editNotes: [],
           editBars: 4,
           editBpm: 120,
+          editBeatsPerBar: 4,
           muted,
           solo,
           volume,
@@ -468,7 +472,7 @@ export function InstrumentGeneratorPanel({
         return trackStates.map(ts => {
           const carry = prevByDbId.get(ts.handle.dbId);
           return carry
-            ? { ...ts, editNotes: carry.editNotes, editBars: carry.editBars, editBpm: carry.editBpm }
+            ? { ...ts, editNotes: carry.editNotes, editBars: carry.editBars, editBpm: carry.editBpm, editBeatsPerBar: carry.editBeatsPerBar }
             : ts;
         });
       });
@@ -634,6 +638,7 @@ export function InstrumentGeneratorPanel({
         editNotes: [],
         editBars: 4,
         editBpm: 120,
+        editBeatsPerBar: 4,
         muted: false,
         solo: false,
         volume: 0.75,
@@ -675,7 +680,7 @@ export function InstrumentGeneratorPanel({
           const mc = await host.getMusicalContext();
           await host.writeMidiClip(handle.id, {
             startTime: 0,
-            endTime: (mc.bars * 4 * 60) / mc.bpm,
+            endTime: panelClipEndSeconds(mc),
             tempo: mc.bpm,
             notes,
           });
@@ -707,11 +712,12 @@ export function InstrumentGeneratorPanel({
 
   // Apply the crossfade volume automation: origin fades out, target fades in
   // across the loop (equal-power, crossover at sliderPos). Falls back to a static
-  // equal-power blend on hosts without setTrackVolumeAutomation.
+  // equal-power blend on hosts without setTrackVolumeAutomation. `timeSignature`
+  // sizes the loop span per the scene meter (omitted = 4/4-identical).
   const applyCrossfadeAutomation = useCallback(
-    async (originTrackId: string, targetTrackId: string, bars: number, bpm: number, sliderPos: number): Promise<void> => {
+    async (originTrackId: string, targetTrackId: string, bars: number, bpm: number, sliderPos: number, timeSignature?: string): Promise<void> => {
       if (host.setTrackVolumeAutomation) {
-        const curves = buildCrossfadeVolumeCurves(bars, bpm, sliderPos);
+        const curves = buildCrossfadeVolumeCurves(bars, bpm, sliderPos, undefined, timeSignature);
         await host.setTrackVolumeAutomation(originTrackId, curves.origin).catch(() => {});
         await host.setTrackVolumeAutomation(targetTrackId, curves.target).catch(() => {});
       } else {
@@ -732,9 +738,10 @@ export function InstrumentGeneratorPanel({
       bpm: number,
       sliderPos: number,
       gesture: FadeGesture,
+      timeSignature?: string,
     ): Promise<void> => {
       if (!host.setTrackVolumeAutomation) return;
-      const points = buildFadeVolumeCurve(bars, bpm, direction, sliderPos, gesture);
+      const points = buildFadeVolumeCurve(bars, bpm, direction, sliderPos, gesture, undefined, timeSignature);
       await host.setTrackVolumeAutomation(trackId, points).catch(() => {});
     },
     [host],
@@ -784,7 +791,7 @@ export function InstrumentGeneratorPanel({
           targetNotes: targetMidi.clips[0]?.notes ?? [],
         });
         const llm = await host.generateWithLLM({
-          system: buildInstrumentSystemPrompt(availableCategories),
+          system: buildInstrumentSystemPrompt(availableCategories, panelMeter(mc)),
           user: userPrompt,
           responseFormat: 'json',
         });
@@ -796,7 +803,7 @@ export function InstrumentGeneratorPanel({
         const notes = await host.postProcessMidi(parsed.notes, { quantize: false, removeOverlaps: false });
         const clip: MidiClipData = {
           startTime: 0,
-          endTime: (mc.bars * 4 * 60) / mc.bpm,
+          endTime: panelClipEndSeconds(mc),
           tempo: mc.bpm,
           notes,
         };
@@ -837,7 +844,7 @@ export function InstrumentGeneratorPanel({
 
         // 5. Crossfade volume automation (origin fades out, target fades in
         // across the loop; equal-power, crossover at the centered slider).
-        await applyCrossfadeAutomation(top.id, bottom.id, mc.bars, mc.bpm, 0.5);
+        await applyCrossfadeAutomation(top.id, bottom.id, mc.bars, mc.bpm, 0.5, panelMeter(mc));
 
         // 6. Persist the pairing.
         const groupId = top.dbId;
@@ -907,7 +914,7 @@ export function InstrumentGeneratorPanel({
           targetNotes: direction === 'in' ? srcNotes : [],
         });
         const llm = await host.generateWithLLM({
-          system: buildInstrumentSystemPrompt(availableCategories),
+          system: buildInstrumentSystemPrompt(availableCategories, panelMeter(mc)),
           user: userPrompt,
           responseFormat: 'json',
         });
@@ -917,7 +924,7 @@ export function InstrumentGeneratorPanel({
         }
         // Pitched — no flatten, no removeOverlaps (polyphonic sampler).
         const notes = await host.postProcessMidi(parsed.notes, { quantize: false, removeOverlaps: false });
-        const clip: MidiClipData = { startTime: 0, endTime: (mc.bars * 4 * 60) / mc.bpm, tempo: mc.bpm, notes };
+        const clip: MidiClipData = { startTime: 0, endTime: panelClipEndSeconds(mc), tempo: mc.bpm, notes };
 
         // 2. Create ONE track (sampler loaded from the source below).
         const track = await host.createTrack({ name: `instrument-${Date.now()}-fade-${direction}` });
@@ -943,7 +950,7 @@ export function InstrumentGeneratorPanel({
         }
 
         // 5. One-sided volume curve (centered slider).
-        await applyFadeAutomation(track.id, direction, mc.bars, mc.bpm, 0.5, gesture);
+        await applyFadeAutomation(track.id, direction, mc.bars, mc.bpm, 0.5, gesture, panelMeter(mc));
         appliedFadeAutomationRef.current.add(track.id);
 
         // 6. Persist the fade metadata.
@@ -1162,7 +1169,7 @@ export function InstrumentGeneratorPanel({
     crossfadeSliderTimers.current[pair.groupId] = setTimeout(() => {
       void (async () => {
         const mc = await host.getMusicalContext();
-        await applyCrossfadeAutomation(pair.origin.handle.id, pair.target.handle.id, mc.bars, mc.bpm, pos);
+        await applyCrossfadeAutomation(pair.origin.handle.id, pair.target.handle.id, mc.bars, mc.bpm, pos, panelMeter(mc));
         if (activeSceneId) {
           const sceneData = (await host.getAllSceneData(activeSceneId)) as Record<string, unknown>;
           for (const dbId of [pair.originDbId, pair.targetDbId]) {
@@ -1196,7 +1203,7 @@ export function InstrumentGeneratorPanel({
     fadeSliderTimers.current[fade.dbId] = setTimeout(() => {
       void (async () => {
         const mc = await host.getMusicalContext();
-        await applyFadeAutomation(fade.track.handle.id, fade.meta.direction, mc.bars, mc.bpm, pos, fade.meta.gesture);
+        await applyFadeAutomation(fade.track.handle.id, fade.meta.direction, mc.bars, mc.bpm, pos, fade.meta.gesture, panelMeter(mc));
         if (activeSceneId) {
           const sceneData = (await host.getAllSceneData(activeSceneId)) as Record<string, unknown>;
           const meta = asFadeMeta(sceneData[`track:${fade.dbId}:fade`]);
@@ -1311,7 +1318,7 @@ export function InstrumentGeneratorPanel({
         const result = await host.readMidiNotes(trackId);
         notes = result.clips[0]?.notes ?? [];
       }
-      updateTrack(trackId, { editNotes: notes, editBars: mc.bars, editBpm: mc.bpm });
+      updateTrack(trackId, { editNotes: notes, editBars: mc.bars, editBpm: mc.bpm, editBeatsPerBar: panelQuarterNotesPerBar(mc) });
     } catch (err: unknown) {
       console.warn('[InstrumentGeneratorPanel] Failed to load MIDI for editing:', err);
     }
@@ -1334,7 +1341,7 @@ export function InstrumentGeneratorPanel({
             const mc = await host.getMusicalContext();
             await host.writeMidiClip(trackId, {
               startTime: 0,
-              endTime: (mc.bars * 4 * 60) / mc.bpm,
+              endTime: panelClipEndSeconds(mc),
               tempo: mc.bpm,
               notes,
             });
@@ -1485,7 +1492,9 @@ export function InstrumentGeneratorPanel({
       const userPrompt = promptParts.join('\n');
 
       const llmResult = await host.generateWithLLM({
-        system: buildInstrumentSystemPrompt(availableCategories),
+        // P8a: the scene meter reshapes the bar arithmetic + appends the
+        // family meter rules (4/4 = legacy byte-identical).
+        system: buildInstrumentSystemPrompt(availableCategories, panelMeter(musicalContext)),
         user: userPrompt,
         responseFormat: 'json',
       });
@@ -1506,7 +1515,7 @@ export function InstrumentGeneratorPanel({
 
       const clipData: MidiClipData = {
         startTime: 0,
-        endTime: (musicalContext.bars * 4 * 60) / musicalContext.bpm,
+        endTime: panelClipEndSeconds(musicalContext),
         tempo: musicalContext.bpm,
         notes: processedNotes,
       };
@@ -1580,6 +1589,7 @@ export function InstrumentGeneratorPanel({
         editNotes: processedNotes,
         editBars: musicalContext.bars,
         editBpm: musicalContext.bpm,
+        editBeatsPerBar: panelQuarterNotesPerBar(musicalContext),
       });
       editLoadStartedRef.current.add(trackId);
       // Generation is a fresh baseline — start sound-history over at this instrument.
@@ -1693,7 +1703,7 @@ export function InstrumentGeneratorPanel({
         const id = fade.track.handle.id;
         if (appliedFadeAutomationRef.current.has(id)) continue;
         appliedFadeAutomationRef.current.add(id);
-        await applyFadeAutomation(id, fade.meta.direction, mc.bars, mc.bpm, fade.meta.sliderPos, fade.meta.gesture);
+        await applyFadeAutomation(id, fade.meta.direction, mc.bars, mc.bpm, fade.meta.sliderPos, fade.meta.gesture, panelMeter(mc));
       }
     })();
   }, [resolvedFades, host, applyFadeAutomation]);
@@ -1919,6 +1929,7 @@ export function InstrumentGeneratorPanel({
           onNotesChange={(notes) => handleNotesChange(track.handle.id, notes)}
           editBars={track.editBars}
           editBpm={track.editBpm}
+          editBeatsPerBar={track.editBeatsPerBar}
           editSnap={0.25}
           onAuditionNote={(pitch, vel, ms) => { void host.auditionNote(track.handle.id, pitch, vel, ms); }}
         />

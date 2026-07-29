@@ -18,8 +18,28 @@
  * Response is a JSON object the panel parses. The `category` field tells
  * the panel which folder to pick a random instrument from after the MIDI
  * is generated (mirrors the drum plugin's role+subRole pick).
+ *
+ * P8a (multi-time-signature): `timeSignature` is the scene meter ("N/D").
+ * Omitted / '4/4' / unparseable → the prompt is BYTE-IDENTICAL to the
+ * legacy 4/4 text (pinned by __tests__/meter-prompt.test.ts). Any other
+ * meter extends the bar-count line with the meter's quarter-note arithmetic
+ * and appends the SDK's per-family meter rules.
  */
-export function buildInstrumentSystemPrompt(availableCategories: readonly string[]): string {
+import {
+  buildPluginMeterGuidance,
+  formatPluginMeterGuidance,
+  tryParseTimeSignature,
+} from '@signalsandsorcery/plugin-sdk';
+
+/** Integers clean, halves as ".5" (meter-derived counts are dyadic-exact). */
+function fmtCount(value: number): string {
+  return String(Math.round(value * 1000) / 1000);
+}
+
+export function buildInstrumentSystemPrompt(
+  availableCategories: readonly string[],
+  timeSignature: string = '4/4',
+): string {
   if (availableCategories.length === 0) {
     // Programmer error — the panel should have refused to call us.
     // Bake a defensive fallback so the LLM at least produces parseable
@@ -28,6 +48,17 @@ export function buildInstrumentSystemPrompt(availableCategories: readonly string
   }
 
   const categoryList = availableCategories.join(', ');
+
+  // Meter-dependent style lines. The 4/4 strings are the EXACT legacy text —
+  // never edit them without expecting the byte-identity snapshot to fail.
+  const parsed = tryParseTimeSignature(timeSignature);
+  const guidance = buildPluginMeterGuidance(timeSignature);
+  const is44 = !parsed || !guidance.rhythm; // '4/4' or unparseable → legacy path
+  const barCountLine = is44
+    ? `- Match the bar count and tempo from the musical context.`
+    : `- Match the bar count and tempo from the musical context — each bar of ${timeSignature} spans ${fmtCount(parsed!.quarterNotesPerBar)} quarter-note beats, so N bars cover startBeat 0 to N×${fmtCount(parsed!.quarterNotesPerBar)}.`;
+  const meterRulesBlock = is44 ? '' : `\n\n${formatPluginMeterGuidance(timeSignature)}`;
+
   return `You are a melodic composition AI. Given a musical context and a text description, generate a pitched, polyphonic MIDI clip for a sample-based instrument.
 
 Respond with ONLY a JSON object in this format:
@@ -49,9 +80,9 @@ Rules:
 - sound: a SHORT phrase (3-8 words) describing the desired TIMBRE / CHARACTER of the instrument. The plugin matches it against a library of per-instrument text descriptions to pick the closest-sounding one. Translate era / genre / mood cues into concrete sonic words: "1950s" → "vintage warm valve mellow", "ambient" → "lush airy evolving pad", "aggressive lead" → "bright cutting detuned saw". Describe tone / material / era / character only — NOT which notes to play. Omit the field only when the request implies no particular timbre.
 
 Style guidance:
-- Match the bar count and tempo from the musical context.
+${barCountLine}
 - Respect any chord/contract hints in the musical context — voice notes consistent with the chord progression at each beat.
 - If "Concurrent tracks in scene" are listed, compose to COMPLEMENT them: lock to the bassline's root motion, avoid clashing with notes already sounding, and leave rhythmic space rather than doubling another part.
 - For monophonic instruments (basses, plucks, leads) emit one note at a time; for polyphonic (pads, keys, organs) chords are welcome.
-- Keep one track focused on one role — don't switch categories mid-clip.`;
+- Keep one track focused on one role — don't switch categories mid-clip.${meterRulesBlock}`;
 }
