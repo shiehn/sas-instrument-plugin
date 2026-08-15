@@ -30,12 +30,8 @@ import type {
   PluginTrackHandle,
   MidiClipData,
   PluginMidiNote,
-  FxCategory,
-  TrackFxDetailState,
-  PluginTrackFxDetailState,
-  PluginFxCategoryDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, EMPTY_FX_DETAIL_STATE, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection, panelClipEndSeconds, panelQuarterNotesPerBar, panelMeter } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, PanelMasterStrip, usePanelBus, type DrawerTab, ImportTrackModal, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, formatConcurrentTracks, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection, panelClipEndSeconds, panelQuarterNotesPerBar, panelMeter } from '@signalsandsorcery/plugin-sdk';
 import { buildInstrumentSystemPrompt } from './src/instrument-system-prompt';
 import { loadLibraries, invalidateInstrumentLibraryCache, pickInstrument, type InstrumentLibrary, type ResolvedInstrument } from './src/instrument-resolver';
 import { parseLLMInstrumentResponse } from './src/parse-llm-response';
@@ -117,9 +113,6 @@ interface InstrumentTrackState {
   solo: boolean;
   volume: number;
   pan: number;
-  // FX drawer state (mirrors drum panel). Optimistically updated by the
-  // handleFx* callbacks; reverted on host-call failure.
-  fxDetailState: TrackFxDetailState;
   // Unified drawer state (replaces fxDrawerOpen + instrumentDrawerOpen). The ▾
   // button opens the non-FX side (History-only for instruments — no Pick tab).
   drawerOpen: boolean;
@@ -450,7 +443,6 @@ export function InstrumentGeneratorPanel({
           solo,
           volume,
           pan,
-          fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
           drawerOpen: false,
           drawerTab: 'fx',
           shuffleHistory: new Set<string>(),
@@ -643,7 +635,6 @@ export function InstrumentGeneratorPanel({
         solo: false,
         volume: 0.75,
         pan: 0,
-        fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
         drawerOpen: false,
         drawerTab: 'fx',
         shuffleHistory: new Set<string>(),
@@ -1239,71 +1230,16 @@ export function InstrumentGeneratorPanel({
     try { await host.setTrackPan(trackId, pan); } catch { /* */ }
   }, [host, updateTrack]);
 
-  // --- FX drawer + per-category controls ---
-  // Lifted verbatim from DrumGeneratorPanel.tsx (~lines 698-751); shape is
-  // generic — no drum-specific bits — so it ports cleanly. Pattern is
-  // optimistic local update, then host call, then revert on failure.
-  const handleFxToggle = useCallback((trackId: string, category: FxCategory, enabled: boolean): void => {
-    setTracks(prev => prev.map(t =>
-      t.handle.id === trackId
-        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], enabled } } }
-        : t
-    ));
-    host.toggleTrackFx(trackId, category, enabled).catch(() => {
-      setTracks(prev => prev.map(t =>
-        t.handle.id === trackId
-          ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], enabled: !enabled } } }
-          : t
-      ));
-    });
-  }, [host]);
-
-  const handleFxPresetChange = useCallback((trackId: string, category: FxCategory, presetIndex: number): void => {
-    setTracks(prev => prev.map(t =>
-      t.handle.id === trackId
-        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], presetIndex } } }
-        : t
-    ));
-    host.setTrackFxPreset(trackId, category, presetIndex).then(result => {
-      if (result.dryWet !== undefined) {
-        setTracks(prev => prev.map(t =>
-          t.handle.id === trackId
-            ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], dryWet: result.dryWet as number } } }
-            : t
-        ));
-      }
-    }).catch(() => {});
-  }, [host]);
-
-  const handleFxDryWetChange = useCallback((trackId: string, category: FxCategory, value: number): void => {
-    setTracks(prev => prev.map(t =>
-      t.handle.id === trackId
-        ? { ...t, fxDetailState: { ...t.fxDetailState, [category]: { ...t.fxDetailState[category], dryWet: value } } }
-        : t
-    ));
-    host.setTrackFxDryWet(trackId, category, value).catch(() => {});
-  }, [host]);
-
+  // --- FX drawer ---
+  // Built-in Tracktion FX were removed in SDK 3.0.0 — the FX tab now shows
+  // only the 3rd-party section, driven entirely by the externalFxHost prop.
   const toggleFxDrawer = useCallback((trackId: string): void => {
-    // Toggle the drawer's open state and, when opening, lazily fetch the
-    // current FX state from the engine so the drawer renders accurate
-    // preset/dry-wet values rather than the EMPTY_FX_DETAIL_STATE
-    // placeholder the track was created with.
     setTracks(prev => prev.map(t => {
       if (t.handle.id !== trackId) return t;
       const onFx = t.drawerOpen && t.drawerTab === 'fx';
       return { ...t, drawerOpen: !onFx, drawerTab: 'fx' };
     }));
-    const track = tracks.find(t => t.handle.id === trackId);
-    const wasOnFx = !!track && track.drawerOpen && track.drawerTab === 'fx';
-    if (track && !wasOnFx) {
-      host.getTrackFxState(trackId).then(fxState => {
-        setTracks(prev => prev.map(t =>
-          t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
-        ));
-      }).catch(() => {});
-    }
-  }, [host, tracks]);
+  }, []);
 
   // --- Piano-roll edit (load on first open, debounced save) ---
   // Lazily fetch the track's current MIDI the first time the Edit tab opens.
@@ -1359,17 +1295,11 @@ export function InstrumentGeneratorPanel({
     setTracks(prev => prev.map(t =>
       t.handle.id === trackId ? { ...t, drawerOpen: true, drawerTab: tab } : t
     ));
-    if (tab === 'fx') {
-      host.getTrackFxState(trackId).then(fxState => {
-        setTracks(prev => prev.map(t =>
-          t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
-        ));
-      }).catch(() => {});
-    } else if (tab === 'edit' && !editLoadStartedRef.current.has(trackId)) {
+    if (tab === 'edit' && !editLoadStartedRef.current.has(trackId)) {
       editLoadStartedRef.current.add(trackId);
       void loadEditNotes(trackId);
     }
-  }, [host, loadEditNotes]);
+  }, [loadEditNotes]);
 
   // --- Duplicate track: new instance with the same MIDI + same instrument/sample.
   // Mirrors DrumGeneratorPanel.handleCopy. host.duplicateTrack copies the MIDI
@@ -1890,7 +1820,6 @@ export function InstrumentGeneratorPanel({
             pan: track.pan,
           }}
           soloedOut={anySolo && !track.solo}
-          fxDetailState={track.fxDetailState}
           drawerOpen={track.drawerOpen}
           drawerTab={track.drawerTab}
           onTabChange={(tab) => handleTabChange(track.handle.id, tab)}
@@ -1904,10 +1833,7 @@ export function InstrumentGeneratorPanel({
           onGenerate={() => handleGenerate(track.handle.id)}
           onCopy={() => handleCopy(track.handle.id)}
           onShuffle={() => handleShuffle(track.handle.id)}
-          onFxToggle={(cat: FxCategory, en: boolean) => handleFxToggle(track.handle.id, cat, en)}
           externalFxHost={host}
-          onFxPresetChange={(cat: FxCategory, idx: number) => handleFxPresetChange(track.handle.id, cat, idx)}
-          onFxDryWetChange={(cat: FxCategory, v: number) => handleFxDryWetChange(track.handle.id, cat, v)}
           onToggleFxDrawer={() => toggleFxDrawer(track.handle.id)}
           onDelete={() => handleDeleteTrack(track.handle.id)}
           onMuteToggle={() => handleMuteToggle(track.handle.id)}
@@ -1944,27 +1870,6 @@ export function InstrumentGeneratorPanel({
 // parseLLMInstrumentResponse + LLMInstrumentResponse extracted to
 // ./src/parse-llm-response.ts (shared with the agent-facing generate_instrument
 // skill in src/main/services/plugin-skill-handlers.ts).
-
-/**
- * Convert the SDK's PluginTrackFxDetailState (fetched via host.getTrackFxState)
- * into the slimmer TrackFxDetailState shape the TrackRow component expects.
- * Lifted verbatim from DrumGeneratorPanel.tsx:1015-1028 — generic helper, no
- * drum-specific bits.
- */
-function pluginFxToToggleFx(sdkState: PluginTrackFxDetailState): TrackFxDetailState {
-  const result = { ...EMPTY_FX_DETAIL_STATE };
-  for (const category of ['eq', 'compressor', 'chorus', 'phaser', 'delay', 'reverb'] as const) {
-    const sdkCat = sdkState[category] as PluginFxCategoryDetailState | undefined;
-    if (sdkCat) {
-      result[category] = {
-        enabled: sdkCat.enabled,
-        presetIndex: sdkCat.presetIndex,
-        dryWet: sdkCat.dryWet,
-      };
-    }
-  }
-  return result;
-}
 
 // Re-export for the panel container; keeps the InstrumentGeneratorPlugin's
 // index.ts dependency surface unchanged across the rewrite.
