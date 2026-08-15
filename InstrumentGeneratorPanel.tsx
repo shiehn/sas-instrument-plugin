@@ -158,7 +158,6 @@ export function InstrumentGeneratorPanel({
   const [libraryError, setLibraryError] = useState<string | null>(null);
   const [isAddingTrack, setIsAddingTrack] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-  const [soundImportTarget, setSoundImportTarget] = useState<InstrumentTrackState | null>(null);
   // Transition Designer (transition scenes): the single board replacing the
   // per-pair "+ Crossfade"/"+ Fade" modals, plus parsed pair metadata for the
   // active scene (members are normal tracks linked via scene-data).
@@ -233,12 +232,16 @@ export function InstrumentGeneratorPanel({
   });
 
   // Import just the instrument SAMPLE (zones) from a track in another scene
-  // (drawer "Import Sample"), bypassing the contract gate. Read the source
+  // (the drawer's Import tab), bypassing the contract gate. Read the source
   // sound via host.getTrackSound, then apply + record it (undoable, persisted).
-  const handleSoundImportPick = useCallback(
-    async (sel: { sourceTrackDbId: string; trackName: string; sceneName: string }): Promise<void> => {
-      const target = soundImportTarget;
-      if (!target || !host.getTrackSound) { setSoundImportTarget(null); return; }
+  // The destination arrives as an argument — the browser lives in the row that
+  // owns it (SDK 3.1.0).
+  const handleSoundImportPickFor = useCallback(
+    async (
+      target: InstrumentTrackState,
+      sel: { sourceTrackDbId: string; trackName: string; sceneName: string },
+    ): Promise<void> => {
+      if (!host.getTrackSound) return;
       try {
         const snap = await host.getTrackSound(sel.sourceTrackDbId);
         if (!snap || snap.kind !== 'instrument') {
@@ -251,11 +254,9 @@ export function InstrumentGeneratorPanel({
         host.showToast('success', 'Sample imported', `${snap.label} → ${target.handle.name}`);
       } catch (err: unknown) {
         host.showToast('error', 'Import failed', err instanceof Error ? err.message : String(err));
-      } finally {
-        setSoundImportTarget(null);
       }
     },
-    [soundImportTarget, host, applyInstrumentSound, soundHistory],
+    [host, applyInstrumentSound, soundHistory],
   );
 
   // Phase 1.1 (sample pack distribution): pack-status drives the empty-state
@@ -1693,18 +1694,9 @@ export function InstrumentGeneratorPanel({
           testIdPrefix="instruments-import"
         />
       )}
-      {host.listImportableTracks && host.getTrackSound && (
-        <ImportTrackModal
-          host={host}
-          mode="sound"
-          open={!!soundImportTarget}
-          title="Import Sample"
-          onClose={() => setSoundImportTarget(null)}
-          onImported={() => {}}
-          onPick={handleSoundImportPick}
-          testIdPrefix="instruments-sound-import"
-        />
-      )}
+      {/* No sound-import modal: the drawer's Import tab browses scenes inline
+          (SDK 3.1.0). The whole-track import above keeps its modal — it is
+          launched from the panel header, not from a row. */}
       {libraryError && (
         <div className="text-xs text-red-400 px-2 py-1">{libraryError}</div>
       )}
@@ -1849,7 +1841,7 @@ export function InstrumentGeneratorPanel({
           soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
           onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
           onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
-          onImportSound={() => setSoundImportTarget(track)}
+          onImportPick={(sel) => handleSoundImportPickFor(track, sel)}
           importSoundLabel="Import Sample"
           editNotes={track.editNotes}
           onNotesChange={(notes) => handleNotesChange(track.handle.id, notes)}
