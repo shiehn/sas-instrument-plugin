@@ -459,13 +459,24 @@ export function InstrumentGeneratorPanel({
       // wipe the seeded notes while the latch still marks the track loaded, so
       // opening the Edit tab skips the engine refetch and shows an empty piano
       // roll even though the MIDI is safe in the engine + DB. Preserving the
-      // buffer keeps editLoadStartedRef and editNotes consistent.
+      // buffer keeps editLoadStartedRef and editNotes consistent. The drawer's
+      // view state (open / tab) rides along: a reload is a data refresh, not a
+      // UI reset — an agent mutation fired while the Edit-tab piano roll was
+      // open must not slam every drawer shut.
       setTracks(prev => {
         const prevByDbId = new Map(prev.map(p => [p.handle.dbId, p]));
         return trackStates.map(ts => {
           const carry = prevByDbId.get(ts.handle.dbId);
           return carry
-            ? { ...ts, editNotes: carry.editNotes, editBars: carry.editBars, editBpm: carry.editBpm, editBeatsPerBar: carry.editBeatsPerBar }
+            ? {
+                ...ts,
+                editNotes: carry.editNotes,
+                editBars: carry.editBars,
+                editBpm: carry.editBpm,
+                editBeatsPerBar: carry.editBeatsPerBar,
+                drawerOpen: carry.drawerOpen,
+                drawerTab: carry.drawerTab,
+              }
             : ts;
         });
       });
