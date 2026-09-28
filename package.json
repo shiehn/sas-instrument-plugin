@@ -1,6 +1,6 @@
 {
   "name": "@signalsandsorcery/instrument-generator",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Pitched, polyphonic sample-based instruments",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

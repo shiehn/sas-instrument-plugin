@@ -514,11 +514,19 @@ export function InstrumentGeneratorPanel({
       if (tracksLoadedForSceneRef.current === sceneAtStart) {
         setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
         setFadesMeta(parseFades(sceneData));
+        // The track set just changed (scene load, engine ready, agent mutation,
+        // port / crossfade / fade / copy / import, all of which end here). The
+        // host routes a panel's tracks into its scene bus only inside a bus
+        // read, so ask for a coalesced re-read: without it a new track sits
+        // outside the bus until a scene switch or reopen (S-027 gap G1).
+        // Stable identity (SDK 3.19.0), so it can't re-create loadTracks.
+        // Optional call: a no-op on an SDK without it.
+        panelBus.notifyTracksChanged?.();
       }
     } catch (err) {
       console.error('[InstrumentGeneratorPanel] Failed to load tracks:', err);
     }
-  }, [host, activeSceneId, packStatus, userPackCount, soundHistory]);
+  }, [host, activeSceneId, packStatus, userPackCount, soundHistory, panelBus.notifyTracksChanged]);
 
   useEffect(() => {
     void loadTracks();
@@ -651,6 +659,10 @@ export function InstrumentGeneratorPanel({
         drawerTab: 'fx',
         shuffleHistory: new Set<string>(),
       }]);
+      // Add Track is the one create path that doesn't end in loadTracks(), so
+      // it asks for the bus re-read itself: the fresh track joins the scene's
+      // panel bus now, not at the next scene switch (S-027 gap G1).
+      panelBus.notifyTracksChanged?.();
       onExpandSelf?.();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -659,7 +671,7 @@ export function InstrumentGeneratorPanel({
       isAddingTrackRef.current = false;
       setIsAddingTrack(false);
     }
-  }, [host, tracks.length, isConnected, isAuthenticated, availableCategories, onExpandSelf]);
+  }, [host, tracks.length, isConnected, isAuthenticated, availableCategories, onExpandSelf, panelBus.notifyTracksChanged]);
 
   // Cross-panel import ("re-sound a part on a sampled instrument"): pull a MIDI
   // part out of a track owned by ANOTHER panel in THIS scene and play it on a
