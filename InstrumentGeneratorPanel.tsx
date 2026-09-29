@@ -1825,7 +1825,7 @@ export function InstrumentGeneratorPanel({
         <TrackRow
           key={track.handle.id}
           drag={reorder.dragPropsFor(index)}
-          track={{ id: track.handle.id, name: track.handle.name, role: track.category }}
+          track={{ id: track.handle.id, name: track.handle.name, role: track.category, dbId: track.handle.dbId }}
           levels={supportsMeters ? trackLevels : undefined}
           prompt={track.prompt}
           runtimeState={{
